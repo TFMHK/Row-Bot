@@ -1,13 +1,11 @@
-#include <SPI.h>
-#include <nRF24L01.h>
-#include <RF24.h>
-#include <Servo.h>
+#include <RH_ASK.h>
+#include <ServoTimer2.h>
 
 // --- הגדרות פינים (מותאם ל-Arduino Mega מומלץ) ---
-// רדיו
-RF24 radio(7, 8); // CE, CSN
-const byte addressToBoat[6] = "00001";
-const byte addressToShore[6] = "00002";
+// רדיו: speed=2000bps, rxPin=7, txPin=6
+RH_ASK driver(2000, 7, 6);
+
+const int LED_RADIO = 5; // לד מצב קליטה
 
 // מנועי נסיעה (L298N #1)
 const int PWM_LEFT = 2; const int IN1 = 22; const int IN2 = 24;
@@ -18,7 +16,7 @@ const int PWM_WINCH = 4; const int IN5 = 30; const int IN6 = 32;
 
 // סרוו למכ"ם
 const int RADAR_SERVO_PIN = 9;
-Servo radarServo;
+ServoTimer2 radarServo;
 
 // חיישני אולטרה-סוני (T=Trig, E=Echo)
 const int US_RADAR_T = 34; const int US_RADAR_E = 35;
@@ -49,6 +47,11 @@ TelemetryPacket telemetry;
 unsigned long previousMillis = 0;
 const long TELEMETRY_INTERVAL = 100; // 10 הרץ
 
+// הצהרות קדימה
+void controlDriveMotors(int leftSpeed, int rightSpeed);
+void controlWinchMotor(int winchSpeed);
+int getDistance(int trigPin, int echoPin);
+
 void setup() {
   // אתחול מנועים
   pinMode(PWM_LEFT, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
@@ -62,27 +65,30 @@ void setup() {
   pinMode(US_RIGHT_T, OUTPUT); pinMode(US_RIGHT_E, INPUT);
   
   radarServo.attach(RADAR_SERVO_PIN);
-  radarServo.write(90); // מרכז
+  radarServo.write(1472); // מרכז (90 מעלות)
   
+  pinMode(LED_RADIO, OUTPUT);
+  digitalWrite(LED_RADIO, LOW);
+
   // אתחול רדיו
-  if (!radio.begin()) {
+  if (!driver.init()) {
     while (1); // שגיאת רדיו קריטית
   }
-  radio.openWritingPipe(addressToShore);
-  radio.openReadingPipe(1, addressToBoat);
-  radio.setPALevel(RF24_PA_MAX);
-  radio.startListening();
 }
 
 void loop() {
   // 1. קריאת פקודות מממסר החוף
-  if (radio.available()) {
-    radio.read(&cmd, sizeof(CommandPacket));
-    
-    // ביצוע הפקודות
-    controlDriveMotors(cmd.leftSpeed, cmd.rightSpeed);
-    controlWinchMotor(cmd.winchSpeed);
-    radarServo.write(cmd.radarAngle);
+  uint8_t buf[sizeof(CommandPacket)];
+  uint8_t buflen = sizeof(CommandPacket);
+  if (driver.recv(buf, &buflen)) {
+    if (buflen == sizeof(CommandPacket)) {
+      digitalWrite(LED_RADIO, HIGH);
+      memcpy(&cmd, buf, sizeof(CommandPacket));
+      controlDriveMotors(cmd.leftSpeed, cmd.rightSpeed);
+      controlWinchMotor(cmd.winchSpeed);
+      radarServo.write(map(cmd.radarAngle, 0, 180, 544, 2400));
+      digitalWrite(LED_RADIO, LOW);
+    }
   }
 
   // 2. קריאת חיישנים ושליחת טלמטריה בזמן קבוע
@@ -98,9 +104,8 @@ void loop() {
     telemetry.radarAngle = cmd.radarAngle;
     
     // שידור הטלמטריה
-    radio.stopListening(); 
-    radio.write(&telemetry, sizeof(TelemetryPacket));
-    radio.startListening(); 
+    driver.send((uint8_t*)&telemetry, sizeof(TelemetryPacket));
+    driver.waitPacketSent();
   }
 }
 
