@@ -3,6 +3,10 @@ const connectionState = document.getElementById("connectionState");
 const modeSwitch = document.getElementById("modeSwitch");
 const pullNetBtn = document.getElementById("pullNetBtn");
 const releaseNetBtn = document.getElementById("releaseNetBtn");
+const mockSwitch = document.getElementById("mockSwitch");
+const portSelect = document.getElementById("portSelect");
+const refreshPortsBtn = document.getElementById("refreshPortsBtn");
+const serverMessage = document.getElementById("serverMessage");
 
 const leftSpeedValue = document.getElementById("leftSpeedValue");
 const rightSpeedValue = document.getElementById("rightSpeedValue");
@@ -21,11 +25,13 @@ const radarCanvas = document.getElementById("radarCanvas");
 const radarCtx = radarCanvas.getContext("2d");
 
 const state = {
-  port: null,
-  reader: null,
-  writer: null,
-  keepReading: false,
+  connected: false,
+  mockEnabled: false,
+  serialPort: "",
+  lastError: "",
+  pollId: null,
   commandLoopId: null,
+  sendingCommand: false,
   lastRadarAngleSent: 90,
   manualMode: true,
   telemetry: {
@@ -51,90 +57,78 @@ const state = {
 };
 
 const CONTROL_INTERVAL_MS = 80;
+const POLL_INTERVAL_MS = 250;
 const AUTONOMOUS_SPEED = 150;
 const AVOID_SPEED = 170;
 const SAFE_DISTANCE_CM = 60;
 
 connectBtn.addEventListener("click", onConnectClick);
 modeSwitch.addEventListener("change", onModeChange);
+refreshPortsBtn.addEventListener("click", refreshPorts);
+mockSwitch.addEventListener("change", onMockToggle);
 
 setupJoystick();
 setupWinchButtons();
+startPolling();
+refreshPorts();
 requestAnimationFrame(drawRadar);
 
 async function onConnectClick() {
-  if (!("serial" in navigator)) {
-    alert("הדפדפן לא תומך ב-Web Serial. מומלץ Chrome או Edge.");
+  if (state.mockEnabled) {
+    setServerMessage("מצב מוק דאטא פעיל. כבה מוק כדי להתחבר לבקר אמיתי.", false);
     return;
   }
 
-  if (state.port) {
-    await disconnectSerial();
+  if (state.connected) {
+    await postJson("/api/disconnect", {});
+    applyRemoteState(await fetchState());
+    return;
+  }
+
+  const port = portSelect.value;
+  if (!port) {
+    await refreshPorts();
+  }
+  if (!portSelect.value) {
+    setServerMessage("לא נמצא פורט COM זמין. ודא שהארדואינו מחובר למחשב.", true);
     return;
   }
 
   try {
-    const port = await navigator.serial.requestPort();
-    await port.open({ baudRate: 115200 });
-
-    state.port = port;
-    state.writer = port.writable.getWriter();
-    state.keepReading = true;
-
-    setConnectedUI(true);
-    startCommandLoop();
-    readSerialLoop();
+    const response = await postJson("/api/connect", {
+      port: portSelect.value,
+      baudRate: 115200,
+    });
+    applyRemoteState(response.state);
+    setServerMessage(`מחובר ל-${response.state.serialPort}.`, false);
   } catch (err) {
-    console.error(err);
-    alert("נכשל חיבור ל-Serial.");
+    setServerMessage(`חיבור נכשל: ${err.message}`, true);
   }
 }
 
-async function disconnectSerial() {
-  state.keepReading = false;
-
-  if (state.commandLoopId) {
-    clearInterval(state.commandLoopId);
-    state.commandLoopId = null;
-  }
-
+async function onMockToggle() {
   try {
-    if (state.reader) {
-      await state.reader.cancel();
-      state.reader.releaseLock();
-      state.reader = null;
-    }
+    const response = await postJson("/api/mock", { enabled: mockSwitch.checked });
+    applyRemoteState(response.state);
   } catch (err) {
-    console.warn("reader close error", err);
+    mockSwitch.checked = !mockSwitch.checked;
+    setServerMessage(`החלפת מצב מוק נכשלה: ${err.message}`, true);
   }
-
-  try {
-    if (state.writer) {
-      await state.writer.write(new TextEncoder().encode("0,0,0,90\\n"));
-      state.writer.releaseLock();
-      state.writer = null;
-    }
-  } catch (err) {
-    console.warn("writer close error", err);
-  }
-
-  try {
-    if (state.port) {
-      await state.port.close();
-      state.port = null;
-    }
-  } catch (err) {
-    console.warn("port close error", err);
-  }
-
-  setConnectedUI(false);
 }
 
-function setConnectedUI(connected) {
-  connectBtn.textContent = connected ? "נתק" : "התחבר ל-Serial";
-  connectionState.textContent = connected ? "מחובר" : "לא מחובר";
-  connectionState.classList.toggle("connected", connected);
-  connectionState.classList.toggle("disconnected", !connected);
+function startPolling() {
+  if (state.pollId) {
+    clearInterval(state.pollId);
+  }
+
+  state.pollId = setInterval(async () => {
+    try {
+      applyRemoteState(await fetchState());
+    } catch (err) {
+      setServerMessage(`שגיאת שרת: ${err.message}`, true);
+      setConnectedUI(false, "");
+    }
+  }, POLL_INTERVAL_MS);
 }
 
 function startCommandLoop() {
@@ -143,7 +137,7 @@ function startCommandLoop() {
   }
 
   state.commandLoopId = setInterval(async () => {
-    if (!state.port || !state.writer) {
+    if ((!state.connected && !state.mockEnabled) || state.sendingCommand) {
       return;
     }
 
@@ -151,86 +145,134 @@ function startCommandLoop() {
       updateAutonomousCommand();
     }
 
-    state.lastRadarAngleSent = state.cmd.radarAngle;
-    updateCommandUI();
-
-    const line = `${state.cmd.leftSpeed},${state.cmd.rightSpeed},${state.cmd.winchSpeed},${state.cmd.radarAngle}\n`;
+    state.sendingCommand = true;
     try {
-      await state.writer.write(new TextEncoder().encode(line));
+      const response = await postJson("/api/command", state.cmd);
+      applyRemoteState(response.state);
     } catch (err) {
-      console.error("send command failed", err);
+      setServerMessage(`שליחת פקודה נכשלה: ${err.message}`, true);
+    } finally {
+      state.sendingCommand = false;
     }
   }, CONTROL_INTERVAL_MS);
 }
 
-async function readSerialLoop() {
-  if (!state.port?.readable) {
-    return;
-  }
-
-  const decoder = new TextDecoder();
-  let pending = "";
-
-  while (state.port && state.keepReading) {
-    try {
-      state.reader = state.port.readable.getReader();
-
-      while (state.keepReading) {
-        const { value, done } = await state.reader.read();
-        if (done) {
-          break;
-        }
-
-        pending += decoder.decode(value, { stream: true });
-        const lines = pending.split("\n");
-        pending = lines.pop() ?? "";
-
-        for (const rawLine of lines) {
-          parseTelemetryLine(rawLine.trim());
-        }
-      }
-    } catch (err) {
-      console.error("read error", err);
-      break;
-    } finally {
-      if (state.reader) {
-        state.reader.releaseLock();
-        state.reader = null;
-      }
-    }
-  }
-
-  if (state.port) {
-    await disconnectSerial();
+function stopCommandLoop() {
+  if (state.commandLoopId) {
+    clearInterval(state.commandLoopId);
+    state.commandLoopId = null;
   }
 }
 
-function parseTelemetryLine(line) {
-  if (!line) {
-    return;
+async function refreshPorts() {
+  try {
+    const response = await getJson("/api/ports");
+    const selected = portSelect.value;
+    portSelect.innerHTML = "";
+
+    for (const port of response.ports) {
+      const option = document.createElement("option");
+      option.value = port;
+      option.textContent = port;
+      portSelect.appendChild(option);
+    }
+
+    if (selected && response.ports.includes(selected)) {
+      portSelect.value = selected;
+    }
+
+    if (!response.ports.length) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "אין פורטים";
+      portSelect.appendChild(option);
+    }
+  } catch (err) {
+    setServerMessage(`רענון פורטים נכשל: ${err.message}`, true);
+  }
+}
+
+async function fetchState() {
+  const response = await getJson("/api/state");
+  return response.state;
+}
+
+function applyRemoteState(remoteState) {
+  const wasConnected = state.connected;
+  state.connected = Boolean(remoteState.connected);
+  state.mockEnabled = Boolean(remoteState.mockEnabled);
+  state.serialPort = remoteState.serialPort || "";
+  state.lastError = remoteState.lastError || "";
+  state.telemetry = {
+    usRadar: remoteState.telemetry.usRadar,
+    usFront: remoteState.telemetry.usFront,
+    usLeft: remoteState.telemetry.usLeft,
+    usRight: remoteState.telemetry.usRight,
+    radarAngle: remoteState.telemetry.radarAngle,
+  };
+  state.cmd = {
+    leftSpeed: remoteState.command.leftSpeed,
+    rightSpeed: remoteState.command.rightSpeed,
+    winchSpeed: remoteState.command.winchSpeed,
+    radarAngle: remoteState.command.radarAngle,
+  };
+  state.lastRadarAngleSent = remoteState.telemetry.radarAngle ?? state.cmd.radarAngle;
+
+  updateTelemetryUI();
+  updateCommandUI();
+  setConnectedUI(state.connected, state.serialPort);
+  mockSwitch.checked = state.mockEnabled;
+  portSelect.disabled = state.mockEnabled || state.connected;
+  refreshPortsBtn.disabled = state.mockEnabled || state.connected;
+
+  if (state.telemetry.usRadar !== null) {
+    addRadarPoint(state.lastRadarAngleSent, state.telemetry.usRadar);
   }
 
-  const parts = line.split(",").map((v) => Number.parseInt(v, 10));
-  if (parts.length !== 5 || parts.some(Number.isNaN)) {
-    console.warn("non-telemetry message:", line);
-    return;
+  if (state.lastError) {
+    setServerMessage(state.lastError, true);
+  } else if (state.mockEnabled) {
+    setServerMessage("מצב מוק דאטא פעיל - טלמטריה סימולטיבית בזמן אמת.", false);
+  } else if (state.connected) {
+    setServerMessage(`מחובר ל-${state.serialPort}.`, false);
+  } else if (wasConnected && !state.connected) {
+    setServerMessage("החיבור לבקר נותק.", true);
   }
 
-  state.telemetry.usRadar = parts[0];
-  state.telemetry.usFront = parts[1];
-  state.telemetry.usLeft = parts[2];
-  state.telemetry.usRight = parts[3];
-  state.telemetry.radarAngle = parts[4];
-  state.lastRadarAngleSent = parts[4];
+  if ((state.connected || state.mockEnabled) && !state.commandLoopId) {
+    startCommandLoop();
+  }
+  if (!state.connected && !state.mockEnabled) {
+    stopCommandLoop();
+  }
+}
 
-  radarValue.textContent = String(parts[0]);
-  frontValue.textContent = String(parts[1]);
-  leftValue.textContent = String(parts[2]);
-  rightValue.textContent = String(parts[3]);
-  radarAngleValue.textContent = String(parts[4]);
+function setConnectedUI(connected, portName) {
+  const active = connected || state.mockEnabled;
+  connectBtn.disabled = state.mockEnabled;
+  connectBtn.textContent = connected ? "נתק" : "חבר לבקר";
+  connectionState.textContent = state.mockEnabled ? "מוק דאטא" : connected ? `מחובר ${portName}` : "לא מחובר";
+  connectionState.classList.toggle("connected", active);
+  connectionState.classList.toggle("disconnected", !active);
+}
 
-  radarDistanceValue.textContent = parts[0] === 999 ? "OUT" : String(parts[0]);
-  addRadarPoint(parts[4], parts[0]);
+function updateTelemetryUI() {
+  radarValue.textContent = formatDistance(state.telemetry.usRadar);
+  frontValue.textContent = formatDistance(state.telemetry.usFront);
+  leftValue.textContent = formatDistance(state.telemetry.usLeft);
+  rightValue.textContent = formatDistance(state.telemetry.usRight);
+  radarAngleValue.textContent = String(state.lastRadarAngleSent);
+  radarDistanceValue.textContent = formatDistance(state.telemetry.usRadar, true);
+}
+
+function formatDistance(value, outLabel = false) {
+  if (value === null || value === undefined) {
+    return "--";
+  }
+  if (value === 999) {
+    return outLabel ? "OUT" : "999";
+  }
+  return String(value);
 }
 
 function onModeChange() {
@@ -285,13 +327,14 @@ function setupJoystick() {
   joystickBase.addEventListener("pointermove", onPointerMove);
 
   const stop = (event) => {
-    if (state.joystick.active) {
-      state.joystick.active = false;
-      if (event?.pointerId !== undefined) {
-        joystickBase.releasePointerCapture(event.pointerId);
-      }
-      resetJoystick();
+    if (!state.joystick.active) {
+      return;
     }
+    state.joystick.active = false;
+    if (event?.pointerId !== undefined) {
+      joystickBase.releasePointerCapture(event.pointerId);
+    }
+    resetJoystick();
   };
 
   joystickBase.addEventListener("pointerup", stop);
@@ -302,12 +345,8 @@ function updateManualCommandFromJoystick() {
   const forward = -state.joystick.y;
   const turn = state.joystick.x;
 
-  const left = clamp(Math.round((forward + turn) * 255), -255, 255);
-  const right = clamp(Math.round((forward - turn) * 255), -255, 255);
-
-  state.cmd.leftSpeed = left;
-  state.cmd.rightSpeed = right;
-
+  state.cmd.leftSpeed = clamp(Math.round((forward + turn) * 255), -255, 255);
+  state.cmd.rightSpeed = clamp(Math.round((forward - turn) * 255), -255, 255);
   updateCommandUI();
 }
 
@@ -348,9 +387,7 @@ function updateAutonomousCommand() {
   const usLeft = state.telemetry.usLeft ?? 999;
   const usRight = state.telemetry.usRight ?? 999;
 
-  const obstacleAhead = usFront !== 999 && usFront < SAFE_DISTANCE_CM;
-
-  if (obstacleAhead) {
+  if (usFront !== 999 && usFront < SAFE_DISTANCE_CM) {
     if (usLeft > usRight) {
       state.cmd.leftSpeed = -AVOID_SPEED;
       state.cmd.rightSpeed = AVOID_SPEED;
@@ -383,15 +420,16 @@ function updateCommandUI() {
 
 function addRadarPoint(angleDeg, distanceCm) {
   const normalizedDistance = distanceCm === 999 ? 340 : clamp(distanceCm, 0, 340);
+  const now = Date.now();
 
   state.radarPoints.push({
     angleDeg,
     distanceCm: normalizedDistance,
-    ts: Date.now(),
+    ts: now,
   });
 
-  const cutoff = Date.now() - 7000;
-  state.radarPoints = state.radarPoints.filter((p) => p.ts > cutoff);
+  const cutoff = now - 7000;
+  state.radarPoints = state.radarPoints.filter((point) => point.ts > cutoff);
 }
 
 function drawRadar() {
@@ -402,7 +440,6 @@ function drawRadar() {
   const maxRadius = Math.min(w * 0.45, h - 30);
 
   radarCtx.clearRect(0, 0, w, h);
-
   radarCtx.fillStyle = "rgba(0, 20, 16, 0.85)";
   radarCtx.fillRect(0, 0, w, h);
 
@@ -417,11 +454,9 @@ function drawRadar() {
 
   for (let angle = 0; angle <= 180; angle += 30) {
     const rad = toRadarRad(angle);
-    const x = centerX + Math.cos(rad) * maxRadius;
-    const y = centerY + Math.sin(rad) * maxRadius;
     radarCtx.beginPath();
     radarCtx.moveTo(centerX, centerY);
-    radarCtx.lineTo(x, y);
+    radarCtx.lineTo(centerX + Math.cos(rad) * maxRadius, centerY + Math.sin(rad) * maxRadius);
     radarCtx.stroke();
   }
 
@@ -430,12 +465,9 @@ function drawRadar() {
     const alpha = Math.max(0.1, 1 - (now - point.ts) / 7000);
     const rad = toRadarRad(point.angleDeg);
     const r = (point.distanceCm / 340) * maxRadius;
-    const x = centerX + Math.cos(rad) * r;
-    const y = centerY + Math.sin(rad) * r;
-
     radarCtx.fillStyle = `rgba(0, 255, 163, ${alpha})`;
     radarCtx.beginPath();
-    radarCtx.arc(x, y, 3, 0, Math.PI * 2);
+    radarCtx.arc(centerX + Math.cos(rad) * r, centerY + Math.sin(rad) * r, 3, 0, Math.PI * 2);
     radarCtx.fill();
   }
 
@@ -452,6 +484,35 @@ function drawRadar() {
 
 function toRadarRad(angleDeg) {
   return Math.PI - (angleDeg * Math.PI) / 180;
+}
+
+function setServerMessage(message, isError) {
+  serverMessage.textContent = message;
+  serverMessage.style.color = isError ? "#b00020" : "";
+}
+
+async function getJson(url) {
+  const response = await fetch(url, { cache: "no-store" });
+  return parseJsonResponse(response);
+}
+
+async function postJson(url, body) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  return parseJsonResponse(response);
+}
+
+async function parseJsonResponse(response) {
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload.error || `HTTP ${response.status}`);
+  }
+  return payload;
 }
 
 function clamp(value, min, max) {

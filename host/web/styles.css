@@ -67,6 +67,34 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
+}
+
+.port-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+}
+
+.port-picker select {
+  min-width: 112px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  padding: 9px 10px;
+  background: #ffffff;
+  color: var(--ink);
+  font: inherit;
+}
+
+.server-panel {
+  padding: 10px 14px;
+}
+
+.server-message {
+  margin: 0;
+  color: var(--text-soft);
+  font-weight: 500;
 }
 
 button {

@@ -12,10 +12,24 @@
       <header class="panel topbar">
         <h1>שו"ב סירה</h1>
         <div class="top-actions">
-          <button id="connectBtn" class="primary">התחבר ל-Serial</button>
+          <label class="switch-wrap" for="mockSwitch">
+            <span>מוק דאטא</span>
+            <input id="mockSwitch" type="checkbox" />
+            <span class="switch-slider" aria-hidden="true"></span>
+          </label>
+          <label class="port-picker" for="portSelect">
+            <span>פורט חוף</span>
+            <select id="portSelect"></select>
+          </label>
+          <button id="refreshPortsBtn" type="button">רענן פורטים</button>
+          <button id="connectBtn" class="primary">חבר לבקר</button>
           <span id="connectionState" class="badge disconnected">לא מחובר</span>
         </div>
       </header>
+
+      <section class="panel server-panel">
+        <p id="serverMessage" class="server-message">השרת המקומי זמין. בחר פורט COM של ארדואינו החוף וחבר.</p>
+      </section>
 
       <section class="panel radar-panel">
         <div class="panel-header">
