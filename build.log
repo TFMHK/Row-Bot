@@ -1,0 +1,87 @@
+Processing uno (platform: atmelavr; board: uno; framework: arduino)
+--------------------------------------------------------------------------------
+Tool Manager: Installing platformio/toolchain-atmelavr @ ~1.70300.0
+Downloading 0% 10% 20% 30% 40% 50% 60% 70% 80% 90% 100%
+Unpacking 0% 10% 20% 30% 40% 50% 60% 70% 80% 90% 100%
+Tool Manager: toolchain-atmelavr@1.70300.191015 has been installed!
+Tool Manager: Installing platformio/framework-arduino-avr @ ~5.4.0
+Downloading 0% 10% 20% 30% 40% 50% 60% 70% 80% 90% 100%
+Unpacking 0% 10% 20% 30% 40% 50% 60% 70% 80% 90% 100%
+Tool Manager: framework-arduino-avr@5.4.0 has been installed!
+Tool Manager: Installing platformio/tool-scons @ ~4.40801.0
+Downloading 0% 10% 20% 30% 40% 50% 60% 70% 80% 90% 100%
+Unpacking 0% 10% 20% 30% 40% 50% 60% 70% 80% 90% 100%
+Tool Manager: tool-scons@4.40801.0 has been installed!
+CONFIGURATION: https://docs.platformio.org/page/boards/atmelavr/uno.html
+PLATFORM: Atmel AVR (5.3.0) > Arduino Uno
+HARDWARE: ATMEGA328P 16MHz, 2KB RAM, 31.50KB Flash
+DEBUG: Current (avr-stub) External (avr-stub, simavr)
+PACKAGES: 
+ - framework-arduino-avr @ 5.4.0 
+ - toolchain-atmelavr @ 1.70300.191015 (7.3.0)
+LDF: Library Dependency Finder -> https://bit.ly/configure-pio-ldf
+LDF Modes: Finder ~ chain, Compatibility ~ soft
+Found 5 compatible libraries
+Scanning dependencies...
+No dependencies
+Building in release mode
+avr-g++ -o .pio\build\uno\src\main.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -Iinclude -Isrc -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard src\main.cpp
+avr-gcc-ar rc .pio\build\uno\libFrameworkArduinoVariant.a
+avr-g++ -o .pio\build\uno\FrameworkArduino\CDC.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\CDC.cpp
+avr-g++ -o .pio\build\uno\FrameworkArduino\HardwareSerial.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\HardwareSerial.cpp
+avr-g++ -o .pio\build\uno\FrameworkArduino\HardwareSerial0.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\HardwareSerial0.cpp
+avr-g++ -o .pio\build\uno\FrameworkArduino\HardwareSerial1.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\HardwareSerial1.cpp
+avr-g++ -o .pio\build\uno\FrameworkArduino\HardwareSerial2.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\HardwareSerial2.cpp
+avr-g++ -o .pio\build\uno\FrameworkArduino\HardwareSerial3.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\HardwareSerial3.cpp
+avr-g++ -o .pio\build\uno\FrameworkArduino\IPAddress.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\IPAddress.cpp
+avr-g++ -o .pio\build\uno\FrameworkArduino\PluggableUSB.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\PluggableUSB.cpp
+avr-g++ -o .pio\build\uno\FrameworkArduino\Print.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\Print.cpp
+avr-g++ -o .pio\build\uno\FrameworkArduino\Stream.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\Stream.cpp
+avr-g++ -o .pio\build\uno\FrameworkArduino\Tone.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\Tone.cpp
+avr-g++ -o .pio\build\uno\FrameworkArduino\USBCore.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\USBCore.cpp
+avr-gcc -o .pio\build\uno\FrameworkArduino\WInterrupts.c.o -c -std=gnu11 -fno-fat-lto-objects -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\WInterrupts.c
+avr-g++ -o .pio\build\uno\FrameworkArduino\WMath.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\WMath.cpp
+avr-g++ -o .pio\build\uno\FrameworkArduino\WString.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\WString.cpp
+avr-g++ -o .pio\build\uno\FrameworkArduino\abi.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\abi.cpp
+avr-gcc -o .pio\build\uno\FrameworkArduino\hooks.c.o -c -std=gnu11 -fno-fat-lto-objects -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\hooks.c
+avr-g++ -o .pio\build\uno\FrameworkArduino\main.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\main.cpp
+avr-g++ -o .pio\build\uno\FrameworkArduino\new.cpp.o -c -fno-exceptions -fno-threadsafe-statics -fpermissive -std=gnu++11 -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\new.cpp
+avr-gcc -o .pio\build\uno\FrameworkArduino\wiring.c.o -c -std=gnu11 -fno-fat-lto-objects -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\wiring.c
+avr-gcc -o .pio\build\uno\FrameworkArduino\wiring_analog.c.o -c -std=gnu11 -fno-fat-lto-objects -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\wiring_analog.c
+avr-gcc -o .pio\build\uno\FrameworkArduino\wiring_digital.c.o -c -std=gnu11 -fno-fat-lto-objects -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\wiring_digital.c
+avr-gcc -mmcu=atmega328p -x assembler-with-cpp -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard -c -o .pio\build\uno\FrameworkArduino\wiring_pulse.S.o C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\wiring_pulse.S
+avr-gcc -o .pio\build\uno\FrameworkArduino\wiring_pulse.c.o -c -std=gnu11 -fno-fat-lto-objects -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\wiring_pulse.c
+avr-gcc -o .pio\build\uno\FrameworkArduino\wiring_shift.c.o -c -std=gnu11 -fno-fat-lto-objects -mmcu=atmega328p -Os -Wall -ffunction-sections -fdata-sections -flto -DPLATFORMIO=60119 -DARDUINO_AVR_UNO -DF_CPU=16000000L -DARDUINO_ARCH_AVR -DARDUINO=10808 -IC:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino -IC:\Users\user\.platformio\packages\framework-arduino-avr\variants\standard C:\Users\user\.platformio\packages\framework-arduino-avr\cores\arduino\wiring_shift.c
+avr-gcc-ar rc .pio\build\uno\libFrameworkArduino.a .pio\build\uno\FrameworkArduino\CDC.cpp.o .pio\build\uno\FrameworkArduino\HardwareSerial.cpp.o .pio\build\uno\FrameworkArduino\HardwareSerial0.cpp.o .pio\build\uno\FrameworkArduino\HardwareSerial1.cpp.o .pio\build\uno\FrameworkArduino\HardwareSerial2.cpp.o .pio\build\uno\FrameworkArduino\HardwareSerial3.cpp.o .pio\build\uno\FrameworkArduino\IPAddress.cpp.o .pio\build\uno\FrameworkArduino\PluggableUSB.cpp.o .pio\build\uno\FrameworkArduino\Print.cpp.o .pio\build\uno\FrameworkArduino\Stream.cpp.o .pio\build\uno\FrameworkArduino\Tone.cpp.o .pio\build\uno\FrameworkArduino\USBCore.cpp.o .pio\build\uno\FrameworkArduino\WInterrupts.c.o .pio\build\uno\FrameworkArduino\WMath.cpp.o .pio\build\uno\FrameworkArduino\WString.cpp.o .pio\build\uno\FrameworkArduino\abi.cpp.o .pio\build\uno\FrameworkArduino\hooks.c.o .pio\build\uno\FrameworkArduino\main.cpp.o .pio\build\uno\FrameworkArduino\new.cpp.o .pio\build\uno\FrameworkArduino\wiring.c.o .pio\build\uno\FrameworkArduino\wiring_analog.c.o .pio\build\uno\FrameworkArduino\wiring_digital.c.o .pio\build\uno\FrameworkArduino\wiring_pulse.S.o .pio\build\uno\FrameworkArduino\wiring_pulse.c.o .pio\build\uno\FrameworkArduino\wiring_shift.c.o
+avr-g++ -o .pio\build\uno\firmware.elf -mmcu=atmega328p -Os -Wl,--gc-sections -flto -fuse-linker-plugin .pio\build\uno\src\main.cpp.o -L.pio\build\uno -Wl,--start-group .pio\build\uno\libFrameworkArduinoVariant.a .pio\build\uno\libFrameworkArduino.a -lm -Wl,--end-group
+MethodWrapper(["checkprogsize"], [".pio\build\uno\firmware.elf"])
+Advanced Memory Usage is available via "PlatformIO Home > Project Inspect"
+RAM:   [          ]   0.6% (used 13 bytes from 2048 bytes)
+Flash: [          ]   5.0% (used 1604 bytes from 32256 bytes)
+.pio\build\uno\firmware.elf  :
+
+section                    size      addr
+
+.data                         4   8388864
+
+.text                      1600         0
+
+.bss                          9   8388868
+
+.comment                     17         0
+
+.note.gnu.avr.deviceinfo     64         0
+
+.debug_aranges               96         0
+
+.debug_info                2085         0
+
+.debug_abbrev              1502         0
+
+.debug_line                 410         0
+
+.debug_str                  520         0
+
+Total                      6307
+avr-objcopy -O ihex -R .eeprom .pio\build\uno\firmware.elf .pio\build\uno\firmware.hex
+======================== [SUCCESS] Took 157.86 seconds ========================
