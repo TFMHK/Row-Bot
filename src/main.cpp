@@ -39,6 +39,7 @@ struct TelemetryPacket {
   int usFront;
   int usLeft;
   int usRight;
+  int radarAngle;
 };
 
 CommandPacket cmd;
@@ -94,6 +95,7 @@ void loop() {
     telemetry.usFront = getDistance(US_FRONT_T, US_FRONT_E);
     telemetry.usLeft = getDistance(US_LEFT_T, US_LEFT_E);
     telemetry.usRight = getDistance(US_RIGHT_T, US_RIGHT_E);
+    telemetry.radarAngle = cmd.radarAngle;
     
     // שידור הטלמטריה
     radio.stopListening(); 

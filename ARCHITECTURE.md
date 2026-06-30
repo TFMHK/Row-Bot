@@ -58,7 +58,7 @@
 ### ארדואינו חוף → מחשב (Serial, 115200 baud)
 
 ```
-<usRadar>,<usFront>,<usLeft>,<usRight>\n
+<usRadar>,<usFront>,<usLeft>,<usRight>,<radarAngle>\n
 ```
 
 | שדה       | יחידה | תיאור                     |
@@ -67,6 +67,7 @@
 | `usFront` | ס"מ   | מרחק חיישן קדמי קבוע      |
 | `usLeft`  | ס"מ   | מרחק חיישן שמאלי קבוע     |
 | `usRight` | ס"מ   | מרחק חיישן ימני קבוע      |
+| `radarAngle` | מעלות | זווית הסרוו בזמן הדגימה |
 
 ---
 

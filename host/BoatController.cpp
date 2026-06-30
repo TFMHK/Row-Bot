@@ -327,9 +327,9 @@ bool BoatController::readTelemetry(Telemetry& out, int timeoutMs, std::string* e
     }
 
     Telemetry t;
-    int parsed = std::sscanf(line.c_str(), "%d,%d,%d,%d",
-                             &t.usRadar, &t.usFront, &t.usLeft, &t.usRight);
-    if (parsed != 4) {
+    int parsed = std::sscanf(line.c_str(), "%d,%d,%d,%d,%d",
+                             &t.usRadar, &t.usFront, &t.usLeft, &t.usRight, &t.radarAngle);
+    if (parsed != 5) {
         // לא טלמטריה – ככל הנראה הודעת שגיאה מהממסר (למשל "ERROR: ...")
         if (errorLine) *errorLine = line;
         lastError_ = "Non-telemetry line: " + line;

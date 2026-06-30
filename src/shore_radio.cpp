@@ -23,6 +23,7 @@ struct TelemetryPacket {
   int usFront;
   int usLeft;
   int usRight;
+  int radarAngle;
 };
 
 CommandPacket cmd = {0, 0, 0, 90}; // ערכי ברירת מחדל
@@ -71,6 +72,7 @@ void loop() {
     Serial.print(telemetry.usRadar); Serial.print(",");
     Serial.print(telemetry.usFront); Serial.print(",");
     Serial.print(telemetry.usLeft); Serial.print(",");
-    Serial.println(telemetry.usRight);
+    Serial.print(telemetry.usRight); Serial.print(",");
+    Serial.println(telemetry.radarAngle);
   }
 }

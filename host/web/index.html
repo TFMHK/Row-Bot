@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>שו"ב סירה</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="bg-gradient"></div>
+    <main class="layout">
+      <header class="panel topbar">
+        <h1>שו"ב סירה</h1>
+        <div class="top-actions">
+          <button id="connectBtn" class="primary">התחבר ל-Serial</button>
+          <span id="connectionState" class="badge disconnected">לא מחובר</span>
+        </div>
+      </header>
+
+      <section class="panel radar-panel">
+        <div class="panel-header">
+          <h2>תמונת מכ"ם</h2>
+          <div class="radar-meta">
+            <span>זווית: <strong id="radarAngleValue">90</strong>°</span>
+            <span>טווח אחרון: <strong id="radarDistanceValue">--</strong> ס"מ</span>
+          </div>
+        </div>
+        <canvas id="radarCanvas" width="600" height="420" aria-label="תצוגת מכ"ם"></canvas>
+      </section>
+
+      <section class="panel controls-panel">
+        <div class="mode-row">
+          <h2>שליטה</h2>
+          <label class="switch-wrap" for="modeSwitch">
+            <span>ידני</span>
+            <input id="modeSwitch" type="checkbox" />
+            <span class="switch-slider" aria-hidden="true"></span>
+            <span>אוטונומי</span>
+          </label>
+        </div>
+
+        <div class="controls-grid">
+          <article class="card">
+            <h3>ניווט - ג'ויסטיק</h3>
+            <div id="joystickBase" class="joystick-base" aria-label="ג'ויסטיק ניווט">
+              <div id="joystickStick" class="joystick-stick"></div>
+            </div>
+            <div class="telemetry-mini">
+              <span>שמאל: <strong id="leftSpeedValue">0</strong></span>
+              <span>ימין: <strong id="rightSpeedValue">0</strong></span>
+            </div>
+          </article>
+
+          <article class="card net-card">
+            <h3>שליטה ברשת</h3>
+            <div class="net-buttons">
+              <button id="pullNetBtn" class="success">משיכת רשת</button>
+              <button id="releaseNetBtn" class="warning">שחרור רשת</button>
+            </div>
+            <p class="hint">לחיצה ממושכת תפעיל את הכננת; בשחרור הכננת נעצרת.</p>
+          </article>
+
+          <article class="card sensors-card">
+            <h3>טלמטריה</h3>
+            <div class="telemetry-grid">
+              <span>קדמי: <strong id="frontValue">--</strong></span>
+              <span>שמאל: <strong id="leftValue">--</strong></span>
+              <span>ימין: <strong id="rightValue">--</strong></span>
+              <span>מכ"ם: <strong id="radarValue">--</strong></span>
+            </div>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <script src="./app.js" defer></script>
+  </body>
+</html>
