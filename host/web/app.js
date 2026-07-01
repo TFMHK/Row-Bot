@@ -1,8 +1,9 @@
 const connectBtn = document.getElementById("connectBtn");
 const connectionState = document.getElementById("connectionState");
 const modeSwitch = document.getElementById("modeSwitch");
-const pullNetBtn = document.getElementById("pullNetBtn");
-const releaseNetBtn = document.getElementById("releaseNetBtn");
+const winchJoystickBase = document.getElementById("winchJoystickBase");
+const winchJoystickHandle = document.getElementById("winchJoystickHandle");
+const winchSpeedValue = document.getElementById("winchSpeedValue");
 const mockSwitch = document.getElementById("mockSwitch");
 const portSelect = document.getElementById("portSelect");
 const refreshPortsBtn = document.getElementById("refreshPortsBtn");
@@ -34,6 +35,7 @@ const state = {
   sendingCommand: false,
   lastRadarAngleSent: 0,
   radarSweepDir: 1,
+  lastRadarStepTime: 0,
   manualMode: true,
   telemetry: {
     usRadar: null,
@@ -64,6 +66,14 @@ const POLL_INTERVAL_MS = 500;
 const AUTONOMOUS_SPEED = 150;
 const AVOID_SPEED = 170;
 const SAFE_DISTANCE_CM = 70;
+// How often the servo advances one sweep step. Faster sweep => a full 0..90
+// pass (which repaints every boat-relative slot) completes well within the TTL,
+// so the radar picture stays filled instead of blinking.
+const RADAR_STEP_INTERVAL_MS = 300;
+// A slot's reading is trusted for this long after it was last measured. Long
+// enough that a full sweep keeps every slot fresh, short enough that blips left
+// behind by boat movement fade instead of forming phantom rings.
+const RADAR_TTL_MS = 4000;
 
 connectBtn.addEventListener("click", onConnectClick);
 modeSwitch.addEventListener("change", onModeChange);
@@ -71,7 +81,7 @@ refreshPortsBtn.addEventListener("click", refreshPorts);
 mockSwitch.addEventListener("change", onMockToggle);
 
 setupJoystick();
-setupWinchButtons();
+setupWinchJoystick();
 startPolling();
 refreshPorts();
 requestAnimationFrame(drawRadar);
@@ -144,7 +154,11 @@ function startCommandLoop() {
     if (!state.manualMode) {
       updateAutonomousCommand();
     }
-    advanceRadarSweep();
+    const now = Date.now();
+    if (now - state.lastRadarStepTime >= RADAR_STEP_INTERVAL_MS) {
+      advanceRadarSweep();
+      state.lastRadarStepTime = now;
+    }
     state.sendingCommand = true;
     try {
       const response = await postJson("/api/command", state.cmd);
@@ -376,27 +390,51 @@ async function resetJoystick() {
   updateCommandUI();
 }
 
-function setupWinchButtons() {
-  const bindHold = (button, speed) => {
-    const start = () => {
-      state.cmd.winchSpeed = speed;
-    };
-    const stop = () => {
-      state.cmd.winchSpeed = 0;
-    };
-    button.addEventListener("pointerdown", start);
-    button.addEventListener("pointerup", stop);
-    button.addEventListener("pointerleave", stop);
-    button.addEventListener("pointercancel", stop);
+function setupWinchJoystick() {
+  let active = false;
+
+  const getClampedDy = (e) => {
+    const rect = winchJoystickBase.getBoundingClientRect();
+    const halfTravel = rect.height / 2 - 30; // 30 = half handle size
+    const dy = e.clientY - (rect.top + rect.height / 2);
+    return Math.max(-halfTravel, Math.min(halfTravel, dy));
   };
-  bindHold(pullNetBtn, 200);
-  bindHold(releaseNetBtn, -200);
+
+  const update = (dy) => {
+    const rect = winchJoystickBase.getBoundingClientRect();
+    const halfTravel = rect.height / 2 - 30;
+    // Drag up (negative dy) = pull net (+speed); drag down = release (-speed)
+    const speed = Math.round((-dy / halfTravel) * 255);
+    state.cmd.winchSpeed = Math.max(-255, Math.min(255, speed));
+    winchJoystickHandle.style.transform = `translate(-50%, calc(-50% + ${dy}px))`;
+    winchSpeedValue.textContent = String(state.cmd.winchSpeed);
+  };
+
+  const stop = () => {
+    if (!active) return;
+    active = false;
+    state.cmd.winchSpeed = 0;
+    winchJoystickHandle.style.transform = "translate(-50%, -50%)";
+    winchSpeedValue.textContent = "0";
+  };
+
+  winchJoystickBase.addEventListener("pointerdown", (e) => {
+    active = true;
+    winchJoystickBase.setPointerCapture(e.pointerId);
+    update(getClampedDy(e));
+  });
+  winchJoystickBase.addEventListener("pointermove", (e) => {
+    if (!active) return;
+    update(getClampedDy(e));
+  });
+  winchJoystickBase.addEventListener("pointerup", stop);
+  winchJoystickBase.addEventListener("pointercancel", stop);
 }
 
 // The 4 sensors sit 90° apart on ONE servo, so sweeping 0..90° already paints
 // the full 360° picture. The PC drives the servo continuously.
 function advanceRadarSweep() {
-  const step = 6;
+  const step = 15;
   let next = state.cmd.radarAngle + step * state.radarSweepDir;
   if (next >= 90) {
     next = 90;
@@ -414,9 +452,11 @@ function advanceRadarSweep() {
 // radarMemory stores each reading at its true bow-relative bearing.
 function getMemoryDistance(bearingDeg, toleranceDeg) {
   let nearest = 999;
+  const now = performance.now();
   for (const [slot, entry] of radarMemory) {
     if (
       entry.value != null &&
+      now - entry.t <= RADAR_TTL_MS &&
       entry.value < nearest &&
       absAngleDiffDeg(slot, bearingDeg) <= toleranceDeg
     ) {
@@ -510,33 +550,86 @@ const SENSOR_BEAMS = [
   { dir: 270, key: "usLeft", color: "rgba(100, 200, 255, 1)" },
 ];
 
-// Radar persistence: each boat-relative angle slot keeps its last scan
-// until a new beam sweeps over it and overwrites the value.
+// Radar persistence: each boat-relative angle slot keeps its last scan for a
+// short while (RADAR_TTL_MS). Fresh sweeps refresh it; stale readings expire so
+// that blips left behind by boat movement/rotation don't linger as phantom
+// rings or arcs that never existed in the world.
 const radarMemory = new Map();
 
 function updateRadarMemory() {
   // The whole sensor array is rotated by the current servo angle.
   const sweep = state.telemetry.radarAngle ?? 0;
+  const now = performance.now();
   for (const beam of SENSOR_BEAMS) {
-    radarMemory.set(normalizeDeg(beam.dir + sweep), {
-      value: state.telemetry[beam.key],
-      color: beam.color,
-    });
+    const slot = normalizeDeg(beam.dir + sweep);
+    const newVal = state.telemetry[beam.key];
+    if (newVal == null) continue;
+    // Always refresh the timestamp when this slot is actually measured, so a
+    // continuously confirmed obstacle stays alive; keep the smoothed value to
+    // avoid flicker from minor (<5 cm) sensor noise.
+    const existing = radarMemory.get(slot);
+    const value =
+      existing && Math.abs(newVal - existing.value) <= 5 ? existing.value : newVal;
+    radarMemory.set(slot, { value, t: now });
+  }
+}
+
+// Remove slots whose last real measurement is older than the TTL.
+function pruneRadarMemory() {
+  const now = performance.now();
+  for (const [slot, entry] of radarMemory) {
+    if (now - entry.t > RADAR_TTL_MS) {
+      radarMemory.delete(slot);
+    }
   }
 }
 
 function drawSensorArcs(cx, cy, maxR) {
-  const fovHalf = 7.5;
-  radarCtx.lineWidth = 3;
+  pruneRadarMemory();
+
+  // Collect the currently valid detections as points at their true
+  // (bearing, distance) location, so a straight wall lands on a straight line
+  // and scattered bodies stay separate dots.
+  const points = [];
   for (const [slot, entry] of radarMemory) {
     if (!entry.value || entry.value >= 999) continue;
     const pixelDist = (entry.value / sim.maxRange) * maxR;
-    const startRad = degToRad(slot - fovHalf);
-    const endRad = degToRad(slot + fovHalf);
-    radarCtx.strokeStyle = entry.color;
+    const rad = degToRad(slot) - Math.PI / 2;
+    points.push({
+      slot,
+      dist: entry.value,
+      x: cx + Math.cos(rad) * pixelDist,
+      y: cy + Math.sin(rad) * pixelDist,
+    });
+  }
+
+  // Connect neighbours that belong to the same continuous surface (a wall):
+  // adjacent bearing slots (<= ~20° apart) whose ranges are close. Grazing-angle
+  // steps along a flat wall grow with 1/cos, so the range gap between two 15°
+  // slots can reach ~55 cm near the wall edges; 70 cm covers that while still
+  // leaving well-separated bodies as isolated dots.
+  points.sort((a, b) => a.slot - b.slot);
+  radarCtx.strokeStyle = "rgba(44, 255, 197, 0.55)";
+  radarCtx.lineWidth = 2;
+  for (let i = 0; i < points.length; i += 1) {
+    const a = points[i];
+    const b = points[(i + 1) % points.length];
+    if (points.length < 2) break;
+    if (absAngleDiffDeg(a.slot, b.slot) <= 20 && Math.abs(a.dist - b.dist) <= 45) {
+      radarCtx.beginPath();
+      radarCtx.moveTo(a.x, a.y);
+      radarCtx.lineTo(b.x, b.y);
+      radarCtx.stroke();
+    }
+    if (points.length === 2) break; // avoid drawing the same pair twice
+  }
+
+  // Draw each detection as a small blip on top of the connecting lines.
+  radarCtx.fillStyle = "rgba(44, 255, 197, 0.95)";
+  for (const p of points) {
     radarCtx.beginPath();
-    radarCtx.arc(cx, cy, pixelDist, startRad, endRad);
-    radarCtx.stroke();
+    radarCtx.arc(p.x, p.y, 2.5, 0, Math.PI * 2);
+    radarCtx.fill();
   }
 }
 
@@ -554,7 +647,7 @@ function drawSensorBeams(cx, cy, maxR) {
     radarCtx.fillStyle = beam.color.replace(", 1)", ", 0.08)");
     radarCtx.beginPath();
     radarCtx.moveTo(cx, cy);
-    radarCtx.arc(cx, cy, maxR, startRad, endRad);
+    radarCtx.arc(cx, cy, maxR, startRad - Math.PI / 2, endRad - Math.PI / 2);
     radarCtx.closePath();
     radarCtx.fill();
 

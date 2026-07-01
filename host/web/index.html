@@ -67,11 +67,16 @@
 
           <article class="card net-card">
             <h3>שליטה ברשת</h3>
-            <div class="net-buttons">
-              <button id="pullNetBtn" class="success">משיכת רשת</button>
-              <button id="releaseNetBtn" class="warning">שחרור רשת</button>
+            <div class="winch-joystick-wrap">
+              <span class="winch-label">▲ משיכה</span>
+              <div id="winchJoystickBase" class="winch-joystick-base" aria-label="ג'ויסטיק כננת">
+                <div id="winchJoystickHandle" class="winch-joystick-handle"></div>
+              </div>
+              <span class="winch-label">▼ שחרור</span>
             </div>
-            <p class="hint">לחיצה ממושכת תפעיל את הכננת; בשחרור הכננת נעצרת.</p>
+            <div class="telemetry-mini" style="margin-top:10px">
+              <span style="grid-column:1/-1;text-align:center">כננת: <strong id="winchSpeedValue">0</strong></span>
+            </div>
           </article>
 
           <article class="card sensors-card">
