@@ -32,6 +32,9 @@ class Telemetry:
     usLeft: int | None = None
     usRight: int | None = None
     radarAngle: int = 90
+    boatHeadingDeg: int = 0
+    boatX: float = 0.0
+    boatY: float = 0.0
 
 
 @dataclass
@@ -56,12 +59,24 @@ class BridgeState:
 
 class SerialBridge:
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._serial: serial.Serial | None = None
         self._reader_thread: threading.Thread | None = None
         self._stop_reader = threading.Event()
         self._mock_thread = threading.Thread(target=self._mock_loop, daemon=True)
         self._state = BridgeState()
+        
+        # Simulation state
+        self._sim_boat_x = 0.0
+        self._sim_boat_y = 0.0
+        self._sim_boat_heading_rad = 0.0
+        self._sim_boat_speed_cms = 0.0
+        self._sim_targets: list[dict] = []
+        self._sim_last_ts = time.time()
+        # Rectangular boundary that exists in the mock world (half extents in cm)
+        self._sim_bounds_half_x = 600.0
+        self._sim_bounds_half_y = 450.0
+        
         self._mock_thread.start()
 
     def list_ports(self) -> list[str]:
@@ -96,8 +111,15 @@ class SerialBridge:
                 self._state.serialPort = "MOCK"
                 self._state.lastError = ""
                 self._state.lastMessageAt = time.time()
-                self._state.telemetry = Telemetry(usRadar=180, usFront=120, usLeft=95, usRight=105, radarAngle=90)
+                self._state.telemetry = Telemetry(usRadar=180, usFront=120, usLeft=95, usRight=105, radarAngle=90, boatX=0.0, boatY=0.0, boatHeadingDeg=0)
                 self._state.command = CommandState()
+                # Initialize simulation
+                self._sim_boat_x = 0.0
+                self._sim_boat_y = 0.0
+                self._sim_boat_heading_rad = 0.0
+                self._sim_boat_speed_cms = 0.0
+                self._sim_targets = self._create_random_targets(24)
+                self._sim_last_ts = time.time()
             else:
                 self._state.mockEnabled = False
                 self._state.serialPort = ""
@@ -200,34 +222,169 @@ class SerialBridge:
                     usLeft=values[2],
                     usRight=values[3],
                     radarAngle=values[4],
+                    boatX=self._sim_boat_x,
+                    boatY=self._sim_boat_y,
                 )
                 self._state.lastError = ""
 
     def _mock_loop(self) -> None:
+        import random
+        
         while True:
-            time.sleep(0.1)
+            time.sleep(0.05)  # 50ms = 20Hz sampling
             with self._lock:
                 if not self._state.mockEnabled:
                     continue
-
+                
                 now = time.time()
-                radar_angle = clamp(self._state.command.radarAngle, 0, 180)
-                radar_phase = math.radians(radar_angle)
+                dt = max(0.01, now - self._sim_last_ts)
+                self._sim_last_ts = now
+                
+                # Update boat dynamics from joystick commands
+                # Throttle: average of left and right speeds (0-1 range)
+                throttle = (self._state.command.leftSpeed + self._state.command.rightSpeed) / (2 * 255)
+                # Turn: difference of left and right speeds (rotation)
+                turn = (self._state.command.rightSpeed - self._state.command.leftSpeed) / (2 * 255)
+                
+                # Update boat speed (smooth acceleration)
+                target_speed = throttle * 180  # Max 180 cm/s
+                self._sim_boat_speed_cms += (target_speed - self._sim_boat_speed_cms) * 0.24 * dt / 0.05
+                
+                # Update boat heading based on turn
+                self._sim_boat_heading_rad += turn * math.pi * dt
+                # Normalize angle to [0, 2π)
+                while self._sim_boat_heading_rad < 0:
+                    self._sim_boat_heading_rad += 2 * math.pi
+                while self._sim_boat_heading_rad >= 2 * math.pi:
+                    self._sim_boat_heading_rad -= 2 * math.pi
+                
+                # Update boat position based on velocity and heading
+                self._sim_boat_x += math.sin(self._sim_boat_heading_rad) * self._sim_boat_speed_cms * dt
+                self._sim_boat_y += math.cos(self._sim_boat_heading_rad) * self._sim_boat_speed_cms * dt
+                
+                # Keep the boat inside the rectangular boundary
+                self._sim_boat_x = clamp(self._sim_boat_x, -self._sim_bounds_half_x, self._sim_bounds_half_x)
+                self._sim_boat_y = clamp(self._sim_boat_y, -self._sim_bounds_half_y, self._sim_bounds_half_y)
+                
+                # Sensor model mirrors the real boat hardware exactly:
+                #   * 4 ultrasonic sensors mounted 90° apart on ONE servo axis.
+                #   * They all rotate together as the servo turns, so a sweep of
+                #     just 0..90° already covers the full 360° around the boat.
+                #   * radarAngle is the servo position, commanded by the PC and
+                #     echoed back; at angle 0 the sensors point F / R / B / L.
+                max_range = 340
+                fov_deg = 15
+                boat_heading_deg = math.degrees(self._sim_boat_heading_rad)
 
-                us_radar = int(55 + 150 * (0.5 + 0.5 * math.sin(now * 1.7 + radar_phase * 2.0)))
-                us_front = int(90 + 45 * math.sin(now * 0.55 + 0.3))
-                us_left = int(100 + 55 * math.sin(now * 0.44 + 1.8))
-                us_right = int(100 + 55 * math.sin(now * 0.44 - 1.8))
+                # The servo follows the last PC command (the firmware just echoes
+                # cmd.radarAngle). No sweep is invented here; the PC drives it.
+                sweep = self._state.command.radarAngle
 
+                us_front = self._cast_sensor_ray(boat_heading_deg + sweep + 0, fov_deg, max_range)
+                us_right = self._cast_sensor_ray(boat_heading_deg + sweep + 90, fov_deg, max_range)
+                us_back = self._cast_sensor_ray(boat_heading_deg + sweep + 180, fov_deg, max_range)
+                us_left = self._cast_sensor_ray(boat_heading_deg + sweep + 270, fov_deg, max_range)
+
+                # Telemetry matches the 5-field serial protocol; the extra boat
+                # pose fields are simulation-only helpers (not on the real wire).
+                # usRadar carries the rear-facing sensor at servo home (0°).
                 self._state.telemetry = Telemetry(
-                    usRadar=clamp(us_radar, 20, 340),
-                    usFront=clamp(us_front, 20, 340),
-                    usLeft=clamp(us_left, 20, 340),
-                    usRight=clamp(us_right, 20, 340),
-                    radarAngle=radar_angle,
+                    usRadar=us_back,
+                    usFront=us_front,
+                    usLeft=us_left,
+                    usRight=us_right,
+                    radarAngle=sweep,
+                    boatHeadingDeg=int(boat_heading_deg) % 360,
+                    boatX=self._sim_boat_x,
+                    boatY=self._sim_boat_y,
                 )
                 self._state.lastMessageAt = now
                 self._state.connected = False
+
+    def _create_random_targets(self, count: int) -> list[dict]:
+        import random
+        targets = []
+        margin = 40  # keep bodies away from the walls
+        min_x = -self._sim_bounds_half_x + margin
+        max_x = self._sim_bounds_half_x - margin
+        min_y = -self._sim_bounds_half_y + margin
+        max_y = self._sim_bounds_half_y - margin
+        for i in range(count):
+            targets.append({
+                'x': random.uniform(min_x, max_x),
+                'y': random.uniform(min_y, max_y),
+                'radius': 14 + random.random() * 26,
+            })
+        return targets
+
+    def _cast_wall_distance(self, center_rad: float, max_range: int) -> float:
+        """Distance from boat to the rectangular boundary along a direction."""
+        sin_t = math.sin(center_rad)
+        cos_t = math.cos(center_rad)
+        half_x = self._sim_bounds_half_x
+        half_y = self._sim_bounds_half_y
+        bx = self._sim_boat_x
+        by = self._sim_boat_y
+        nearest = float('inf')
+        eps = 1e-6
+
+        # Vertical walls: x = +/- half_x
+        if abs(sin_t) > eps:
+            for wx in (-half_x, half_x):
+                t = (wx - bx) / sin_t
+                if t > 0:
+                    y_hit = by + t * cos_t
+                    if -half_y - eps <= y_hit <= half_y + eps and t < nearest:
+                        nearest = t
+        # Horizontal walls: y = +/- half_y
+        if abs(cos_t) > eps:
+            for wy in (-half_y, half_y):
+                t = (wy - by) / cos_t
+                if t > 0:
+                    x_hit = bx + t * sin_t
+                    if -half_x - eps <= x_hit <= half_x + eps and t < nearest:
+                        nearest = t
+        return nearest
+
+    def _cast_sensor_ray(self, center_deg: float, fov_deg: float, max_range: int) -> int:
+        """Cast a sensor ray and find nearest obstacle within FOV."""
+        nearest = max_range + 1
+
+        # Boundary walls (exist in the mock world, detected like any obstacle)
+        wall_dist = self._cast_wall_distance(math.radians(center_deg), max_range)
+        if wall_dist <= max_range:
+            nearest = wall_dist
+
+        for target in self._sim_targets:
+            dx = target['x'] - self._sim_boat_x
+            dy = target['y'] - self._sim_boat_y
+
+            # Distance from boat to target
+            dist = math.hypot(dx, dy)
+
+            # Skip if too far
+            if dist > max_range + target['radius']:
+                continue
+
+            # Angle to target (normalized [0, 360))
+            target_deg = math.degrees(math.atan2(dx, dy)) % 360
+
+            # Shortest angular distance — works even when center_deg is unnormalized
+            # (e.g. 440° for heading 350° + sweep 90°). The naive abs() approach
+            # produces a negative result when the raw diff exceeds 360, letting
+            # out-of-FOV targets pass the check.
+            angle_diff = abs((center_deg - target_deg + 180) % 360 - 180)
+
+            if angle_diff > fov_deg / 2:
+                continue
+            
+            # Impact distance: surface distance minus radius
+            impact = max(20, dist - target['radius'])
+            
+            if impact < nearest:
+                nearest = impact
+        
+        return int(round(nearest)) if nearest <= max_range else 999
 
 
 BRIDGE = SerialBridge()
@@ -290,12 +447,15 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
         raw = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(raw)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return
 
     def _serve_static(self) -> None:
         target = self.path.split("?", 1)[0]
@@ -310,11 +470,14 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
 
         content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
         raw = file_path.read_bytes()
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return
 
 
 def main() -> None:

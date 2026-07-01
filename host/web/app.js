@@ -32,14 +32,15 @@ const state = {
   pollId: null,
   commandLoopId: null,
   sendingCommand: false,
-  lastRadarAngleSent: 90,
+  lastRadarAngleSent: 0,
+  radarSweepDir: 1,
   manualMode: true,
   telemetry: {
     usRadar: null,
     usFront: null,
     usLeft: null,
     usRight: null,
-    radarAngle: 90,
+    radarAngle: 0,
   },
   cmd: {
     leftSpeed: 0,
@@ -52,15 +53,17 @@ const state = {
     y: 0,
     active: false,
   },
-  sweepDirection: 1,
-  radarPoints: [],
+};
+
+const sim = {
+  maxRange: 340,
 };
 
 const CONTROL_INTERVAL_MS = 80;
-const POLL_INTERVAL_MS = 250;
+const POLL_INTERVAL_MS = 500;
 const AUTONOMOUS_SPEED = 150;
 const AVOID_SPEED = 170;
-const SAFE_DISTANCE_CM = 60;
+const SAFE_DISTANCE_CM = 70;
 
 connectBtn.addEventListener("click", onConnectClick);
 modeSwitch.addEventListener("change", onModeChange);
@@ -85,8 +88,7 @@ async function onConnectClick() {
     return;
   }
 
-  const port = portSelect.value;
-  if (!port) {
+  if (!portSelect.value) {
     await refreshPorts();
   }
   if (!portSelect.value) {
@@ -99,7 +101,7 @@ async function onConnectClick() {
       port: portSelect.value,
       baudRate: 115200,
     });
-    applyRemoteState(response.state);
+    applyRemoteState(response.state, true);
     setServerMessage(`מחובר ל-${response.state.serialPort}.`, false);
   } catch (err) {
     setServerMessage(`חיבור נכשל: ${err.message}`, true);
@@ -109,7 +111,7 @@ async function onConnectClick() {
 async function onMockToggle() {
   try {
     const response = await postJson("/api/mock", { enabled: mockSwitch.checked });
-    applyRemoteState(response.state);
+    applyRemoteState(response.state, true);
   } catch (err) {
     mockSwitch.checked = !mockSwitch.checked;
     setServerMessage(`החלפת מצב מוק נכשלה: ${err.message}`, true);
@@ -120,7 +122,6 @@ function startPolling() {
   if (state.pollId) {
     clearInterval(state.pollId);
   }
-
   state.pollId = setInterval(async () => {
     try {
       applyRemoteState(await fetchState());
@@ -140,11 +141,10 @@ function startCommandLoop() {
     if ((!state.connected && !state.mockEnabled) || state.sendingCommand) {
       return;
     }
-
     if (!state.manualMode) {
       updateAutonomousCommand();
     }
-
+    advanceRadarSweep();
     state.sendingCommand = true;
     try {
       const response = await postJson("/api/command", state.cmd);
@@ -197,12 +197,28 @@ async function fetchState() {
   return response.state;
 }
 
-function applyRemoteState(remoteState) {
+function applyRemoteState(remoteState, syncCmd = false) {
   const wasConnected = state.connected;
+
   state.connected = Boolean(remoteState.connected);
   state.mockEnabled = Boolean(remoteState.mockEnabled);
   state.serialPort = remoteState.serialPort || "";
   state.lastError = remoteState.lastError || "";
+
+  // Only overwrite the outgoing command on explicit connect / mock-enable.
+  // During normal operation the browser is the source of truth for state.cmd;
+  // overwriting it from poll responses or command echoes would discard in-flight
+  // user input (e.g. winch button pressed between a poll and the 80ms command tick).
+  if (syncCmd) {
+    state.cmd = {
+      leftSpeed: remoteState.command.leftSpeed,
+      rightSpeed: remoteState.command.rightSpeed,
+      winchSpeed: remoteState.command.winchSpeed,
+      radarAngle: remoteState.command.radarAngle,
+    };
+  }
+
+  // Always use backend telemetry (both real and mock modes).
   state.telemetry = {
     usRadar: remoteState.telemetry.usRadar,
     usFront: remoteState.telemetry.usFront,
@@ -210,29 +226,26 @@ function applyRemoteState(remoteState) {
     usRight: remoteState.telemetry.usRight,
     radarAngle: remoteState.telemetry.radarAngle,
   };
-  state.cmd = {
-    leftSpeed: remoteState.command.leftSpeed,
-    rightSpeed: remoteState.command.rightSpeed,
-    winchSpeed: remoteState.command.winchSpeed,
-    radarAngle: remoteState.command.radarAngle,
-  };
   state.lastRadarAngleSent = remoteState.telemetry.radarAngle ?? state.cmd.radarAngle;
+
+  if (state.mockEnabled || state.connected) {
+    updateRadarMemory();
+  } else {
+    radarMemory.clear();
+  }
 
   updateTelemetryUI();
   updateCommandUI();
   setConnectedUI(state.connected, state.serialPort);
+
   mockSwitch.checked = state.mockEnabled;
   portSelect.disabled = state.mockEnabled || state.connected;
   refreshPortsBtn.disabled = state.mockEnabled || state.connected;
 
-  if (state.telemetry.usRadar !== null) {
-    addRadarPoint(state.lastRadarAngleSent, state.telemetry.usRadar);
-  }
-
   if (state.lastError) {
     setServerMessage(state.lastError, true);
   } else if (state.mockEnabled) {
-    setServerMessage("מצב מוק דאטא פעיל - טלמטריה סימולטיבית בזמן אמת.", false);
+    setServerMessage("מוק דאטא: 4 חיישנים על סרבו מסתובב (0-90°), גופים אקראיים, תנועה לפי ג'ויסטיק", false);
   } else if (state.connected) {
     setServerMessage(`מחובר ל-${state.serialPort}.`, false);
   } else if (wasConnected && !state.connected) {
@@ -261,8 +274,8 @@ function updateTelemetryUI() {
   frontValue.textContent = formatDistance(state.telemetry.usFront);
   leftValue.textContent = formatDistance(state.telemetry.usLeft);
   rightValue.textContent = formatDistance(state.telemetry.usRight);
-  radarAngleValue.textContent = String(state.lastRadarAngleSent);
-  radarDistanceValue.textContent = formatDistance(state.telemetry.usRadar, true);
+  radarAngleValue.textContent = String(Math.round(state.lastRadarAngleSent));
+  radarDistanceValue.textContent = formatDistance(state.telemetry.usFront, true);
 }
 
 function formatDistance(value, outLabel = false) {
@@ -272,18 +285,16 @@ function formatDistance(value, outLabel = false) {
   if (value === 999) {
     return outLabel ? "OUT" : "999";
   }
-  return String(value);
+  return String(Math.round(value));
 }
 
 function onModeChange() {
   state.manualMode = !modeSwitch.checked;
   resetJoystick();
-
   if (!state.manualMode) {
     state.cmd.leftSpeed = 0;
     state.cmd.rightSpeed = 0;
   }
-
   updateCommandUI();
 }
 
@@ -294,7 +305,6 @@ function setupJoystick() {
     if (!state.joystick.active || !state.manualMode) {
       return;
     }
-
     const rect = joystickBase.getBoundingClientRect();
     const centerX = rect.left + rect.width / 2;
     const centerY = rect.top + rect.height / 2;
@@ -304,7 +314,6 @@ function setupJoystick() {
     const max = radius() - joystickStick.clientWidth / 2;
     const len = Math.hypot(dx, dy);
     const scale = len > max ? max / len : 1;
-
     const x = dx * scale;
     const y = dy * scale;
 
@@ -350,16 +359,20 @@ function updateManualCommandFromJoystick() {
   updateCommandUI();
 }
 
-function resetJoystick() {
+async function resetJoystick() {
   state.joystick.x = 0;
   state.joystick.y = 0;
   joystickStick.style.transform = "translate(-50%, -50%)";
-
   if (state.manualMode) {
     state.cmd.leftSpeed = 0;
     state.cmd.rightSpeed = 0;
+    try {
+      const response = await postJson("/api/command", state.cmd);
+      applyRemoteState(response.state);
+    } catch (err) {
+      console.error("Failed to send reset command:", err);
+    }
   }
-
   updateCommandUI();
 }
 
@@ -371,24 +384,55 @@ function setupWinchButtons() {
     const stop = () => {
       state.cmd.winchSpeed = 0;
     };
-
     button.addEventListener("pointerdown", start);
     button.addEventListener("pointerup", stop);
     button.addEventListener("pointerleave", stop);
     button.addEventListener("pointercancel", stop);
   };
-
   bindHold(pullNetBtn, 200);
   bindHold(releaseNetBtn, -200);
 }
 
-function updateAutonomousCommand() {
-  const usFront = state.telemetry.usFront ?? 999;
-  const usLeft = state.telemetry.usLeft ?? 999;
-  const usRight = state.telemetry.usRight ?? 999;
+// The 4 sensors sit 90° apart on ONE servo, so sweeping 0..90° already paints
+// the full 360° picture. The PC drives the servo continuously.
+function advanceRadarSweep() {
+  const step = 6;
+  let next = state.cmd.radarAngle + step * state.radarSweepDir;
+  if (next >= 90) {
+    next = 90;
+    state.radarSweepDir = -1;
+  } else if (next <= 0) {
+    next = 0;
+    state.radarSweepDir = 1;
+  }
+  state.cmd.radarAngle = next;
+}
 
-  if (usFront !== 999 && usFront < SAFE_DISTANCE_CM) {
-    if (usLeft > usRight) {
+// Returns the nearest reading in radarMemory within toleranceDeg of a given
+// boat-relative bearing. Because all 4 sensors rotate together with the servo,
+// raw telemetry fields (usFront etc.) do NOT correspond to fixed hull directions;
+// radarMemory stores each reading at its true bow-relative bearing.
+function getMemoryDistance(bearingDeg, toleranceDeg) {
+  let nearest = 999;
+  for (const [slot, entry] of radarMemory) {
+    if (
+      entry.value != null &&
+      entry.value < nearest &&
+      absAngleDiffDeg(slot, bearingDeg) <= toleranceDeg
+    ) {
+      nearest = entry.value;
+    }
+  }
+  return nearest;
+}
+
+function updateAutonomousCommand() {
+  const distFront = getMemoryDistance(0, 45);
+  const distLeft  = getMemoryDistance(270, 45);
+  const distRight = getMemoryDistance(90, 45);
+
+  if (distFront < SAFE_DISTANCE_CM) {
+    if (distLeft > distRight) {
       state.cmd.leftSpeed = -AVOID_SPEED;
       state.cmd.rightSpeed = AVOID_SPEED;
     } else {
@@ -399,91 +443,131 @@ function updateAutonomousCommand() {
     state.cmd.leftSpeed = AUTONOMOUS_SPEED;
     state.cmd.rightSpeed = AUTONOMOUS_SPEED;
   }
-
-  let nextAngle = state.cmd.radarAngle + state.sweepDirection * 4;
-  if (nextAngle >= 180) {
-    nextAngle = 180;
-    state.sweepDirection = -1;
-  }
-  if (nextAngle <= 0) {
-    nextAngle = 0;
-    state.sweepDirection = 1;
-  }
-  state.cmd.radarAngle = nextAngle;
 }
 
 function updateCommandUI() {
   leftSpeedValue.textContent = String(state.cmd.leftSpeed);
   rightSpeedValue.textContent = String(state.cmd.rightSpeed);
-  radarAngleValue.textContent = String(state.cmd.radarAngle);
-}
-
-function addRadarPoint(angleDeg, distanceCm) {
-  const normalizedDistance = distanceCm === 999 ? 340 : clamp(distanceCm, 0, 340);
-  const now = Date.now();
-
-  state.radarPoints.push({
-    angleDeg,
-    distanceCm: normalizedDistance,
-    ts: now,
-  });
-
-  const cutoff = now - 7000;
-  state.radarPoints = state.radarPoints.filter((point) => point.ts > cutoff);
 }
 
 function drawRadar() {
   const w = radarCanvas.width;
   const h = radarCanvas.height;
-  const centerX = w / 2;
-  const centerY = h - 24;
-  const maxRadius = Math.min(w * 0.45, h - 30);
+  const cx = w / 2;
+  const cy = h / 2;
+  const maxR = Math.min(w, h) * 0.43;
 
   radarCtx.clearRect(0, 0, w, h);
-  radarCtx.fillStyle = "rgba(0, 20, 16, 0.85)";
+  radarCtx.fillStyle = "rgba(0, 20, 16, 0.9)";
   radarCtx.fillRect(0, 0, w, h);
 
-  radarCtx.strokeStyle = "rgba(0, 255, 180, 0.28)";
+  radarCtx.strokeStyle = "rgba(0, 255, 180, 0.25)";
   radarCtx.lineWidth = 1;
 
   for (let i = 1; i <= 4; i += 1) {
     radarCtx.beginPath();
-    radarCtx.arc(centerX, centerY, (maxRadius / 4) * i, Math.PI, 2 * Math.PI);
+    radarCtx.arc(cx, cy, (maxR / 4) * i, 0, Math.PI * 2);
     radarCtx.stroke();
   }
 
-  for (let angle = 0; angle <= 180; angle += 30) {
-    const rad = toRadarRad(angle);
+  for (let deg = 0; deg < 360; deg += 30) {
+    const rad = degToRad(deg);
     radarCtx.beginPath();
-    radarCtx.moveTo(centerX, centerY);
-    radarCtx.lineTo(centerX + Math.cos(rad) * maxRadius, centerY + Math.sin(rad) * maxRadius);
+    radarCtx.moveTo(cx, cy);
+    radarCtx.lineTo(cx + Math.sin(rad) * maxR, cy - Math.cos(rad) * maxR);
     radarCtx.stroke();
   }
 
-  const now = Date.now();
-  for (const point of state.radarPoints) {
-    const alpha = Math.max(0.1, 1 - (now - point.ts) / 7000);
-    const rad = toRadarRad(point.angleDeg);
-    const r = (point.distanceCm / 340) * maxRadius;
-    radarCtx.fillStyle = `rgba(0, 255, 163, ${alpha})`;
-    radarCtx.beginPath();
-    radarCtx.arc(centerX + Math.cos(rad) * r, centerY + Math.sin(rad) * r, 3, 0, Math.PI * 2);
-    radarCtx.fill();
-  }
-
-  const sweepRad = toRadarRad(state.lastRadarAngleSent);
-  radarCtx.strokeStyle = "rgba(44, 255, 197, 0.85)";
-  radarCtx.lineWidth = 2;
-  radarCtx.beginPath();
-  radarCtx.moveTo(centerX, centerY);
-  radarCtx.lineTo(centerX + Math.cos(sweepRad) * maxRadius, centerY + Math.sin(sweepRad) * maxRadius);
-  radarCtx.stroke();
+  drawBoat(cx, cy);
+  drawSensorArcs(cx, cy, maxR);
+  drawSensorBeams(cx, cy, maxR);
 
   requestAnimationFrame(drawRadar);
 }
 
-function toRadarRad(angleDeg) {
-  return Math.PI - (angleDeg * Math.PI) / 180;
+function drawBoat(cx, cy) {
+  radarCtx.save();
+  radarCtx.translate(cx, cy);
+  // Boat always points up - no rotation
+  radarCtx.fillStyle = "rgba(255, 241, 118, 0.95)";
+  radarCtx.beginPath();
+  radarCtx.moveTo(0, -13);
+  radarCtx.lineTo(9, 10);
+  radarCtx.lineTo(0, 6);
+  radarCtx.lineTo(-9, 10);
+  radarCtx.closePath();
+  radarCtx.fill();
+  radarCtx.restore();
+}
+
+// All 4 ultrasonic sensors sit 90° apart on ONE servo axis and rotate together.
+// dir = their bow-relative bearing at servo home (0); the live bearing adds the
+// current servo angle (radarAngle). Boat is drawn pointing up (front = 0°).
+const SENSOR_BEAMS = [
+  { dir: 0, key: "usFront", color: "rgba(44, 255, 197, 1)" },
+  { dir: 90, key: "usRight", color: "rgba(255, 150, 100, 1)" },
+  { dir: 180, key: "usRadar", color: "rgba(200, 120, 255, 1)" },
+  { dir: 270, key: "usLeft", color: "rgba(100, 200, 255, 1)" },
+];
+
+// Radar persistence: each boat-relative angle slot keeps its last scan
+// until a new beam sweeps over it and overwrites the value.
+const radarMemory = new Map();
+
+function updateRadarMemory() {
+  // The whole sensor array is rotated by the current servo angle.
+  const sweep = state.telemetry.radarAngle ?? 0;
+  for (const beam of SENSOR_BEAMS) {
+    radarMemory.set(normalizeDeg(beam.dir + sweep), {
+      value: state.telemetry[beam.key],
+      color: beam.color,
+    });
+  }
+}
+
+function drawSensorArcs(cx, cy, maxR) {
+  const fovHalf = 7.5;
+  radarCtx.lineWidth = 3;
+  for (const [slot, entry] of radarMemory) {
+    if (!entry.value || entry.value >= 999) continue;
+    const pixelDist = (entry.value / sim.maxRange) * maxR;
+    const startRad = degToRad(slot - fovHalf);
+    const endRad = degToRad(slot + fovHalf);
+    radarCtx.strokeStyle = entry.color;
+    radarCtx.beginPath();
+    radarCtx.arc(cx, cy, pixelDist, startRad, endRad);
+    radarCtx.stroke();
+  }
+}
+
+function drawSensorBeams(cx, cy, maxR) {
+  const fovHalf = 7.5;
+  const sweep = state.telemetry.radarAngle ?? 0;
+  radarCtx.save();
+  radarCtx.lineWidth = 1.5;
+  for (const beam of SENSOR_BEAMS) {
+    const startRad = degToRad(beam.dir + sweep - fovHalf);
+    const endRad = degToRad(beam.dir + sweep + fovHalf);
+    const centerRad = degToRad(beam.dir + sweep);
+
+    // Soft FOV fill
+    radarCtx.fillStyle = beam.color.replace(", 1)", ", 0.08)");
+    radarCtx.beginPath();
+    radarCtx.moveTo(cx, cy);
+    radarCtx.arc(cx, cy, maxR, startRad, endRad);
+    radarCtx.closePath();
+    radarCtx.fill();
+
+    // FOV edges + center
+    radarCtx.strokeStyle = beam.color.replace(", 1)", ", 0.6)");
+    for (const rad of [startRad, endRad, centerRad]) {
+      radarCtx.beginPath();
+      radarCtx.moveTo(cx, cy);
+      radarCtx.lineTo(cx + Math.sin(rad) * maxR, cy - Math.cos(rad) * maxR);
+      radarCtx.stroke();
+    }
+  }
+  radarCtx.restore();
 }
 
 function setServerMessage(message, isError) {
@@ -518,3 +602,22 @@ async function parseJsonResponse(response) {
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
+
+function degToRad(deg) {
+  return (deg * Math.PI) / 180;
+}
+
+function normalizeDeg(deg) {
+  let out = deg % 360;
+  if (out < 0) {
+    out += 360;
+  }
+  return out;
+}
+
+function absAngleDiffDeg(a, b) {
+  let d = normalizeDeg(a) - normalizeDeg(b);
+  d = ((d + 540) % 360) - 180;
+  return Math.abs(d);
+}
+
