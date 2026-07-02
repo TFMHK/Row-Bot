@@ -42,6 +42,30 @@
         <canvas id="radarCanvas" width="600" height="420" aria-label="תצוגת מכ"ם"></canvas>
       </section>
 
+      <div class="world-row">
+        <section class="panel radar-panel world-panel">
+          <div class="panel-header">
+            <h2>תמונת עולם (מוק דאטא)</h2>
+            <div class="radar-meta">
+              <span>מיקום: <strong id="worldPosValue">--</strong></span>
+              <span>גופים בטווח: <strong id="worldInRangeValue">--</strong></span>
+            </div>
+          </div>
+          <canvas id="worldCanvas" width="600" height="420" aria-label="תמונת עולם המוק"></canvas>
+        </section>
+
+        <section class="panel radar-panel map-panel">
+          <div class="panel-header">
+            <h2>מפת מכ"ם נצברת</h2>
+            <div class="radar-meta">
+              <span>נקודות: <strong id="mapPointsValue">0</strong></span>
+              <button id="mapClearBtn" type="button" class="mini-btn">נקה מפה</button>
+            </div>
+          </div>
+          <canvas id="mapCanvas" width="600" height="420" aria-label="מפת מכ"ם נצברת מנתוני החיישנים"></canvas>
+        </section>
+      </div>
+
       <section class="panel controls-panel">
         <div class="mode-row">
           <h2>שליטה</h2>
@@ -54,40 +78,32 @@
         </div>
 
         <div class="controls-grid">
-          <article class="card">
-            <h3>ניווט - ג'ויסטיק</h3>
-            <div id="joystickBase" class="joystick-base" aria-label="ג'ויסטיק ניווט">
-              <div id="joystickStick" class="joystick-stick"></div>
-            </div>
-            <div class="telemetry-mini">
-              <span>שמאל: <strong id="leftSpeedValue">0</strong></span>
-              <span>ימין: <strong id="rightSpeedValue">0</strong></span>
-            </div>
-          </article>
-
-          <article class="card net-card">
-            <h3>שליטה ברשת</h3>
-            <div class="winch-joystick-wrap">
-              <span class="winch-label">▲ משיכה</span>
-              <div id="winchJoystickBase" class="winch-joystick-base" aria-label="ג'ויסטיק כננת">
-                <div id="winchJoystickHandle" class="winch-joystick-handle"></div>
+          <div class="joystick-row">
+            <article class="card">
+              <h3>ניווט - ג'ויסטיק</h3>
+              <div id="joystickBase" class="joystick-base" aria-label="ג'ויסטיק ניווט">
+                <div id="joystickStick" class="joystick-stick"></div>
               </div>
-              <span class="winch-label">▼ שחרור</span>
-            </div>
-            <div class="telemetry-mini" style="margin-top:10px">
-              <span style="grid-column:1/-1;text-align:center">כננת: <strong id="winchSpeedValue">0</strong></span>
-            </div>
-          </article>
+              <div class="telemetry-mini">
+                <span>שמאל: <strong id="leftSpeedValue">0</strong></span>
+                <span>ימין: <strong id="rightSpeedValue">0</strong></span>
+              </div>
+            </article>
 
-          <article class="card sensors-card">
-            <h3>טלמטריה</h3>
-            <div class="telemetry-grid">
-              <span>קדמי: <strong id="frontValue">--</strong></span>
-              <span>שמאל: <strong id="leftValue">--</strong></span>
-              <span>ימין: <strong id="rightValue">--</strong></span>
-              <span>אחורה: <strong id="radarValue">--</strong></span>
-            </div>
-          </article>
+            <article class="card net-card">
+              <h3>שליטה ברשת</h3>
+              <div class="winch-joystick-wrap">
+                <span class="winch-label">▲ משיכה</span>
+                <div id="winchJoystickBase" class="winch-joystick-base" aria-label="ג'ויסטיק כננת">
+                  <div id="winchJoystickHandle" class="winch-joystick-handle"></div>
+                </div>
+                <span class="winch-label">▼ שחרור</span>
+              </div>
+              <div class="telemetry-mini" style="margin-top:10px">
+                <span style="grid-column:1/-1;text-align:center">כננת: <strong id="winchSpeedValue">0</strong></span>
+              </div>
+            </article>
+          </div>
         </div>
       </section>
     </main>

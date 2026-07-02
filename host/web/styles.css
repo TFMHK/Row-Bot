@@ -180,12 +180,38 @@ button:disabled {
   font-size: 0.92rem;
 }
 
-#radarCanvas {
+#radarCanvas,
+#worldCanvas,
+#mapCanvas {
   width: 100%;
   height: auto;
   border-radius: 12px;
   background: linear-gradient(180deg, #031926, #001018);
   border: 1px solid rgba(0, 255, 163, 0.25);
+}
+
+.world-panel,
+.map-panel {
+  margin-top: 12px;
+}
+
+.world-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-top: 12px;
+}
+
+.world-row .world-panel,
+.world-row .map-panel {
+  margin-top: 0;
+}
+
+.mini-btn {
+  padding: 5px 12px;
+  font-size: 0.82rem;
+  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  color: #ffffff;
 }
 
 .controls-panel {
@@ -245,8 +271,17 @@ button:disabled {
 
 .controls-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(220px, 1fr));
+  grid-template-columns: 1fr;
   gap: 12px;
+}
+
+.joystick-row {
+  display: flex;
+  gap: 12px;
+}
+
+.joystick-row > .card {
+  flex: 1;
 }
 
 .card {
@@ -352,6 +387,10 @@ button:disabled {
 
 @media (max-width: 900px) {
   .controls-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .world-row {
     grid-template-columns: 1fr;
   }
 

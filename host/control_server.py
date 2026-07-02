@@ -5,6 +5,7 @@ import json
 import math
 import mimetypes
 import os
+import queue
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -65,6 +66,11 @@ class SerialBridge:
         self._stop_reader = threading.Event()
         self._mock_thread = threading.Thread(target=self._mock_loop, daemon=True)
         self._state = BridgeState()
+
+        # SSE fan-out: every connected stream client owns a bounded queue that
+        # receives a fresh state snapshot whenever telemetry or state changes.
+        self._subscribers: set[queue.Queue] = set()
+        self._sub_lock = threading.Lock()
         
         # Simulation state
         self._sim_boat_x = 0.0
@@ -82,6 +88,34 @@ class SerialBridge:
     def list_ports(self) -> list[str]:
         return [port.device for port in list_ports.comports()]
 
+    # --- SSE fan-out -----------------------------------------------------
+
+    def subscribe(self) -> "queue.Queue":
+        """Register a new stream client and return its snapshot queue."""
+        q: queue.Queue = queue.Queue(maxsize=8)
+        with self._sub_lock:
+            self._subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: "queue.Queue") -> None:
+        with self._sub_lock:
+            self._subscribers.discard(q)
+
+    def _publish(self) -> None:
+        """Push the current snapshot to every subscriber (drop-oldest on full)."""
+        data = asdict(self.snapshot())
+        with self._sub_lock:
+            for q in self._subscribers:
+                try:
+                    q.put_nowait(data)
+                except queue.Full:
+                    # Slow client: discard its stalest frame and keep the newest.
+                    try:
+                        q.get_nowait()
+                        q.put_nowait(data)
+                    except (queue.Empty, queue.Full):
+                        pass
+
     def connect(self, port_name: str, baud_rate: int = 115200) -> BridgeState:
         with self._lock:
             self._disconnect_locked(send_stop=False)
@@ -95,12 +129,14 @@ class SerialBridge:
             self._stop_reader.clear()
             self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
             self._reader_thread.start()
+            self._publish()
             return self.snapshot()
 
     def disconnect(self) -> BridgeState:
         with self._lock:
             self._disconnect_locked(send_stop=True)
             self._state.mockEnabled = False
+            self._publish()
             return self.snapshot()
 
     def set_mock_enabled(self, enabled: bool) -> BridgeState:
@@ -124,7 +160,23 @@ class SerialBridge:
                 self._state.mockEnabled = False
                 self._state.serialPort = ""
                 self._state.command = CommandState()
+            self._publish()
             return self.snapshot()
+
+    def world_snapshot(self) -> dict:
+        """Ground-truth mock world: obstacle bodies, boundary and sensor range.
+
+        Only meaningful while mock mode is on; lets the UI draw the real world
+        next to the radar picture for side-by-side comparison.
+        """
+        with self._lock:
+            return {
+                "mockEnabled": self._state.mockEnabled,
+                "boundsHalfX": self._sim_bounds_half_x,
+                "boundsHalfY": self._sim_bounds_half_y,
+                "maxRange": 450,
+                "targets": [dict(t) for t in self._sim_targets],
+            }
 
     def _disconnect_locked(self, send_stop: bool) -> None:
         ser = self._serial
@@ -166,6 +218,7 @@ class SerialBridge:
                 self._serial.write(line.encode("ascii"))
             self._state.command = command
             self._state.lastError = ""
+            self._publish()
             return self.snapshot()
 
     def snapshot(self) -> BridgeState:
@@ -226,6 +279,7 @@ class SerialBridge:
                     boatY=self._sim_boat_y,
                 )
                 self._state.lastError = ""
+                self._publish()
 
     def _mock_loop(self) -> None:
         import random
@@ -247,11 +301,11 @@ class SerialBridge:
                 turn = (self._state.command.rightSpeed - self._state.command.leftSpeed) / (2 * 255)
                 
                 # Update boat speed (smooth acceleration)
-                target_speed = throttle * 180  # Max 180 cm/s
+                target_speed = throttle * 45  # Max 45 cm/s (physical hull limit)
                 self._sim_boat_speed_cms += (target_speed - self._sim_boat_speed_cms) * 0.24 * dt / 0.05
                 
                 # Update boat heading based on turn
-                self._sim_boat_heading_rad += turn * math.pi * dt
+                self._sim_boat_heading_rad += turn * (math.pi * 0.25) * dt
                 # Normalize angle to [0, 2π)
                 while self._sim_boat_heading_rad < 0:
                     self._sim_boat_heading_rad += 2 * math.pi
@@ -272,7 +326,7 @@ class SerialBridge:
                 #     just 0..90° already covers the full 360° around the boat.
                 #   * radarAngle is the servo position, commanded by the PC and
                 #     echoed back; at angle 0 the sensors point F / R / B / L.
-                max_range = 340
+                max_range = 450
                 fov_deg = 15
                 boat_heading_deg = math.degrees(self._sim_boat_heading_rad)
 
@@ -300,6 +354,7 @@ class SerialBridge:
                 )
                 self._state.lastMessageAt = now
                 self._state.connected = False
+            self._publish()
 
     def _create_random_targets(self, count: int) -> list[dict]:
         import random
@@ -309,12 +364,19 @@ class SerialBridge:
         max_x = self._sim_bounds_half_x - margin
         min_y = -self._sim_bounds_half_y + margin
         max_y = self._sim_bounds_half_y - margin
+        # Keep a clear circle around the boat's start point (0, 0). The boat is
+        # dropped into open water, so a body must never spawn on top of it —
+        # otherwise the boat begins already inside an obstacle, which no
+        # controller could avoid.
+        start_clear = 110  # cm clear radius around the origin
         for i in range(count):
-            targets.append({
-                'x': random.uniform(min_x, max_x),
-                'y': random.uniform(min_y, max_y),
-                'radius': 14 + random.random() * 26,
-            })
+            for _attempt in range(50):
+                x = random.uniform(min_x, max_x)
+                y = random.uniform(min_y, max_y)
+                radius = 14 + random.random() * 26
+                if math.hypot(x, y) - radius >= start_clear:
+                    break
+            targets.append({'x': x, 'y': y, 'radius': radius})
         return targets
 
     def _cast_wall_distance(self, center_rad: float, max_range: int) -> float:
@@ -396,8 +458,16 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"state": asdict(BRIDGE.snapshot())})
             return
 
+        if self.path == "/api/stream":
+            self._serve_sse()
+            return
+
         if self.path == "/api/ports":
             self._send_json({"ports": BRIDGE.list_ports()})
+            return
+
+        if self.path == "/api/world":
+            self._send_json(BRIDGE.world_snapshot())
             return
 
         self._serve_static()
@@ -437,6 +507,42 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
+
+    def _serve_sse(self) -> None:
+        """Server-Sent Events stream: pushes a state snapshot on every change.
+
+        Replaces slow client polling — the reader/mock loops publish a fresh
+        snapshot the instant new telemetry is parsed, so the UI updates in
+        near real time. A periodic comment line keeps idle connections alive.
+        """
+        q = BRIDGE.subscribe()
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            # Send the current state immediately so a fresh client isn't blank
+            # until the next telemetry frame arrives.
+            self._sse_send(asdict(BRIDGE.snapshot()))
+            while True:
+                try:
+                    data = q.get(timeout=15)
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    continue
+                self._sse_send(data)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return
+        finally:
+            BRIDGE.unsubscribe(q)
+
+    def _sse_send(self, state: dict[str, Any]) -> None:
+        raw = json.dumps({"state": state}).encode("utf-8")
+        self.wfile.write(b"data: " + raw + b"\n\n")
+        self.wfile.flush()
 
     def _read_json_body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
