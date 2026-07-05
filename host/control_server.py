@@ -437,7 +437,17 @@ class SerialBridge:
             # out-of-FOV targets pass the check.
             angle_diff = abs((center_deg - target_deg + 180) % 360 - 180)
 
-            if angle_diff > fov_deg / 2:
+            # A target is not a point: it subtends an angular half-width of
+            # asin(radius/dist) as seen from the boat. A close body fills a wide
+            # slice of the beam cone, so its SURFACE can be inside the FOV even
+            # when its CENTER is well off-axis. Comparing only the center bearing
+            # (as before) made nearby obstacles invisible unless the servo pointed
+            # almost exactly at them — they were missed as the boat passed by.
+            # Real ultrasonic cones echo off the nearest surface anywhere in the
+            # cone, so subtract the target's angular radius before the FOV test.
+            angular_radius = math.degrees(math.asin(min(1.0, target['radius'] / dist))) if dist > 1e-6 else 90.0
+
+            if angle_diff - angular_radius > fov_deg / 2:
                 continue
             
             # Impact distance: surface distance minus radius
