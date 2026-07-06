@@ -7,11 +7,15 @@ const int PIXEL_PIN = 5;
 const int PIXEL_COUNT = 1;
 Adafruit_NeoPixel pixel(PIXEL_COUNT, PIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
-// מנוע בדיקה יחיד דרך H-Bridge
-// כיוון: D8/D9, מהירות PWM: D10
+// שני מנועים דרך H-Bridge
+// מנוע שמאל: כיוון D8/D9, מהירות PWM D10
 const int MOTOR1_IN1 = 8;
 const int MOTOR1_IN2 = 9;
 const int MOTOR1_PWM = 10;
+// מנוע ימין: כיוון D12/D13, מהירות PWM D11
+const int MOTOR2_IN1 = 12;
+const int MOTOR2_IN2 = 13;
+const int MOTOR2_PWM = 11;
 
 struct CommandPacket {
   int leftSpeed;
@@ -31,13 +35,16 @@ struct TelemetryPacket {
 CommandPacket cmd = {0, 0, 0, 90};
 TelemetryPacket telemetry;
 
-void controlTestMotor(int speed);
+void controlMotor(int in1, int in2, int pwmPin, int speed);
 void setPixelFromCommand(const CommandPacket& packet);
 
 void setup() {
   pinMode(MOTOR1_IN1, OUTPUT);
   pinMode(MOTOR1_IN2, OUTPUT);
   pinMode(MOTOR1_PWM, OUTPUT);
+  pinMode(MOTOR2_IN1, OUTPUT);
+  pinMode(MOTOR2_IN2, OUTPUT);
+  pinMode(MOTOR2_PWM, OUTPUT);
 
   pixel.begin();
   pixel.setBrightness(40);
@@ -54,7 +61,8 @@ void loop() {
   if (driver.recv(buf, &buflen) && buflen == sizeof(CommandPacket)) {
     memcpy(&cmd, buf, sizeof(CommandPacket));
     setPixelFromCommand(cmd);
-    controlTestMotor(cmd.leftSpeed);
+    controlMotor(MOTOR1_IN1, MOTOR1_IN2, MOTOR1_PWM, cmd.leftSpeed);
+    controlMotor(MOTOR2_IN1, MOTOR2_IN2, MOTOR2_PWM, cmd.rightSpeed);
 
     // בחומרת ASK פשוטה עדיף לענות אחרי קבלה במקום לשדר כל הזמן
     telemetry.usRadar = 999;
@@ -67,21 +75,21 @@ void loop() {
   }
 }
 
-void controlTestMotor(int speed) {
+void controlMotor(int in1, int in2, int pwmPin, int speed) {
   int pwm = abs(constrain(speed, -255, 255));
 
   if (speed > 0) {
-    digitalWrite(MOTOR1_IN1, HIGH);
-    digitalWrite(MOTOR1_IN2, LOW);
-    analogWrite(MOTOR1_PWM, pwm);
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+    analogWrite(pwmPin, pwm);
   } else if (speed < 0) {
-    digitalWrite(MOTOR1_IN1, LOW);
-    digitalWrite(MOTOR1_IN2, HIGH);
-    analogWrite(MOTOR1_PWM, pwm);
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+    analogWrite(pwmPin, pwm);
   } else {
-    digitalWrite(MOTOR1_IN1, LOW);
-    digitalWrite(MOTOR1_IN2, LOW);
-    analogWrite(MOTOR1_PWM, 0);
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+    analogWrite(pwmPin, 0);
   }
 }
 

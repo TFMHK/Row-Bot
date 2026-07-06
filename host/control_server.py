@@ -82,7 +82,11 @@ class SerialBridge:
         # Rectangular boundary that exists in the mock world (half extents in cm)
         self._sim_bounds_half_x = 600.0
         self._sim_bounds_half_y = 450.0
-        
+        # Active mock scenario + its start/goal points (world coords, cm).
+        self._sim_scenario = "serpentine"
+        self._sim_start: dict | None = None
+        self._sim_goal: dict | None = None
+
         self._mock_thread.start()
 
     def list_ports(self) -> list[str]:
@@ -139,7 +143,7 @@ class SerialBridge:
             self._publish()
             return self.snapshot()
 
-    def set_mock_enabled(self, enabled: bool) -> BridgeState:
+    def set_mock_enabled(self, enabled: bool, scenario: str = "serpentine") -> BridgeState:
         with self._lock:
             if enabled:
                 self._disconnect_locked(send_stop=True)
@@ -147,15 +151,35 @@ class SerialBridge:
                 self._state.serialPort = "MOCK"
                 self._state.lastError = ""
                 self._state.lastMessageAt = time.time()
-                self._state.telemetry = Telemetry(usRadar=180, usFront=120, usLeft=95, usRight=105, radarAngle=90, boatX=0.0, boatY=0.0, boatHeadingDeg=0)
                 self._state.command = CommandState()
-                # Initialize simulation
-                self._sim_boat_x = 0.0
-                self._sim_boat_y = 0.0
-                self._sim_boat_heading_rad = 0.0
+                self._sim_scenario = scenario
+                # Build the world and drop the boat at the scenario's start pose.
+                if scenario == "serpentine":
+                    # Boustrophedon "maze": three baffle walls with alternating
+                    # gaps. Boat starts bottom-left, goal is the top-right corner,
+                    # so it must weave right-up-left-up-right to cross.
+                    self._sim_targets = self._create_serpentine_targets()
+                    self._sim_boat_x = -(self._sim_bounds_half_x - 80)
+                    self._sim_boat_y = -(self._sim_bounds_half_y - 80)
+                    self._sim_boat_heading_rad = 0.0
+                    self._sim_goal = {
+                        "x": self._sim_bounds_half_x - 80,
+                        "y": self._sim_bounds_half_y - 80,
+                    }
+                else:
+                    self._sim_targets = self._create_random_targets(24)
+                    self._sim_boat_x = 0.0
+                    self._sim_boat_y = 0.0
+                    self._sim_boat_heading_rad = 0.0
+                    self._sim_goal = None
+                self._sim_start = {"x": self._sim_boat_x, "y": self._sim_boat_y}
                 self._sim_boat_speed_cms = 0.0
-                self._sim_targets = self._create_random_targets(24)
                 self._sim_last_ts = time.time()
+                self._state.telemetry = Telemetry(
+                    usRadar=180, usFront=120, usLeft=95, usRight=105, radarAngle=90,
+                    boatX=self._sim_boat_x, boatY=self._sim_boat_y,
+                    boatHeadingDeg=int(math.degrees(self._sim_boat_heading_rad)) % 360,
+                )
             else:
                 self._state.mockEnabled = False
                 self._state.serialPort = ""
@@ -176,6 +200,9 @@ class SerialBridge:
                 "boundsHalfY": self._sim_bounds_half_y,
                 "maxRange": 450,
                 "targets": [dict(t) for t in self._sim_targets],
+                "scenario": self._sim_scenario,
+                "start": dict(self._sim_start) if self._sim_start else None,
+                "goal": dict(self._sim_goal) if self._sim_goal else None,
             }
 
     def _disconnect_locked(self, send_stop: bool) -> None:
@@ -356,6 +383,33 @@ class SerialBridge:
                 self._state.connected = False
             self._publish()
 
+    def _create_serpentine_targets(self) -> list[dict]:
+        """Three baffle walls forming a boustrophedon course (see the sketch).
+
+        Each wall is a dense row of overlapping circles so the ultrasonic rays
+        see a continuous barrier. The gaps alternate side to side, so the only
+        way from the bottom-left start to the top-right goal is to weave:
+        right -> up -> left -> up -> right -> up.
+        """
+        hx = self._sim_bounds_half_x
+        radius = 26.0
+        spacing = 34.0
+
+        def add_wall(targets: list[dict], y: float, x_from: float, x_to: float) -> None:
+            step = spacing if x_to >= x_from else -spacing
+            n = int(abs(x_to - x_from) / spacing)
+            for i in range(n + 1):
+                xi = x_from + step * i
+                targets.append({"x": float(xi), "y": float(y), "radius": radius})
+            targets.append({"x": float(x_to), "y": float(y), "radius": radius})
+
+        targets: list[dict] = []
+        # y splits the pool into 4 lanes (~225 cm tall each).
+        add_wall(targets, -225.0, -hx, 230.0)   # lower divider: wall on LEFT,  gap RIGHT
+        add_wall(targets, 0.0, hx, -230.0)       # middle divider: wall on RIGHT, gap LEFT
+        add_wall(targets, 225.0, -hx, 230.0)     # upper divider: wall on LEFT,  gap RIGHT
+        return targets
+
     def _create_random_targets(self, count: int) -> list[dict]:
         import random
         targets = []
@@ -500,7 +554,8 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
 
             if self.path == "/api/mock":
                 enabled = bool(body.get("enabled", False))
-                self._send_json({"state": asdict(BRIDGE.set_mock_enabled(enabled))})
+                scenario = str(body.get("scenario", "serpentine"))
+                self._send_json({"state": asdict(BRIDGE.set_mock_enabled(enabled, scenario))})
                 return
 
             if self.path == "/api/command":

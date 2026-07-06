@@ -102,6 +102,9 @@ const world = {
   boundsHalfY: 450,
   maxRange: 450,
   targets: [],
+  scenario: null,
+  start: null,   // {x, y} נקודת התחלה בעולם (תרחיש מוק)
+  goal: null,    // {x, y} נקודת היעד בעולם (תרחיש מוק)
 };
 
 const CONTROL_INTERVAL_MS = 80;
@@ -191,8 +194,8 @@ const RADAR_TTL_MS = 5000;
 // רשת הביטחון האחרונה חייבת להיות פנימית לטווח שבו הניווט האוטונומי כבר מתחמק
 // (SAFE_DISTANCE_CM = 70). אחרת שכבת הבטיחות "חוטפת" את ההגה מהניווט לפני שהוא
 // מספיק לתמרן, ושני הבקרים נלחמים ומייצרים זיג-זג. לכן טווח האזהרה קטן מ-70.
-const AVOID_SAFETY_RADIUS = 35;  // ס"מ - קו אדום ל-J-Turn, אסור לסירה להיות במרחק כזה ממכשול
-const AVOID_WARNING_RADIUS = 60; // ס"מ - טווח הדיפה (קטן מ-SAFE_DISTANCE_CM כדי לתת לניווט להתחמק קודם)
+const AVOID_SAFETY_RADIUS = 28;  // ס"מ - קו אדום ל-J-Turn, אסור לסירה להיות במרחק כזה ממכשול
+const AVOID_WARNING_RADIUS = 50; // ס"מ - טווח הדיפה (קטן מ-SAFE_DISTANCE_CM כדי לתת לניווט להתחמק קודם)
 // ניפוח מכשולים (Obstacle Inflation): הניווט מתייחס לסירה כאל נקודה, אך לגוף יש
 // אורך פיזי וציר-הסיבוב אינו ממורכז — בסיבוב-במקום זנב הסירה "מטאטא" קשת ועלול
 // לפגוע במכשול שהחרטום פינה. לכן מנפחים כל מכשול ברדיוס = חצי אורך הסירה + מרווח
@@ -453,6 +456,8 @@ async function ensureWorldLoaded() {
   if (!state.mockEnabled) {
     world.loaded = false;
     world.targets = [];
+    world.start = null;
+    world.goal = null;
     return;
   }
   if (world.loaded || world.loading) return;
@@ -463,6 +468,9 @@ async function ensureWorldLoaded() {
     world.boundsHalfY = w.boundsHalfY ?? world.boundsHalfY;
     world.maxRange = w.maxRange ?? world.maxRange;
     world.targets = Array.isArray(w.targets) ? w.targets : [];
+    world.scenario = w.scenario ?? null;
+    world.start = w.start ?? null;
+    world.goal = w.goal ?? null;
     world.loaded = true;
   } catch (err) {
     // Non-fatal: world view simply stays empty until the next attempt.
@@ -508,6 +516,17 @@ function applyRemoteState(remoteState, syncCmd = false) {
     boatHeadingDeg: remoteState.telemetry.boatHeadingDeg ?? 0,
   };
   state.lastRadarAngleSent = remoteState.telemetry.radarAngle ?? state.cmd.radarAngle;
+
+  if (syncCmd) {
+    // תרחישי מוק יכולים להתחיל את הסירה בכל מקום (למשל פינה). מזריעים את מסגרת
+    // האודומטריה מפוזת-ההתחלה האמיתית של המוק, כדי שהמפה, הקירות והיעד כולם יחיו
+    // באותה מסגרת קואורדינטות עקבית. (חומרה אמיתית מדווחת 0,0 — אין שינוי שם.)
+    state.pose.x = state.telemetry.boatX ?? 0;
+    state.pose.y = state.telemetry.boatY ?? 0;
+    state.pose.headingDeg = state.telemetry.boatHeadingDeg ?? 0;
+    state.pose.speedCms = 0;
+    state.lastPoseT = 0;
+  }
 
   if (state.mockEnabled || state.connected) {
     updateRadarMemory();
@@ -856,6 +875,18 @@ function chooseOpenHeading(refBearing = 0, penalty = OPEN_TURN_PENALTY) {
 // \u05e7\u05d5\u05d1\u05e2 \u05d0\u05ea \u05d4\u05d9\u05e2\u05d3 \u05e2\u05dd \u05db\u05e0\u05d9\u05e1\u05d4 \u05dc\u05de\u05e6\u05d1 \u05d0\u05d5\u05d8\u05d5\u05e0\u05d5\u05de\u05d9: \u05d4\u05d3\u05d5\u05e4\u05df \u05d4\u05e7\u05e8\u05d5\u05d1\u05d4 \u05d1\u05d9\u05d5\u05ea\u05e8 \u05d4\u05d9\u05d0 \u05d4\u05de\u05d5\u05e6\u05d0,
 // \u05d5\u05d4\u05d9\u05e2\u05d3 \u05d4\u05d5\u05d0 \u05d4\u05d3\u05d5\u05e4\u05df \u05e9\u05de\u05de\u05d5\u05dc \u05d1\u05d0\u05d5\u05ea\u05d4 \u05e7\u05d5\u05d0\u05d5\u05e8\u05d3\u05d9\u05e0\u05d8\u05d4 \u05e6\u05d3\u05d3\u05d9\u05ea ("\u05d4\u05e7\u05e6\u05d4 \u05d4\u05e9\u05e0\u05d9").
 function initNavGoal() {
+  // תרחיש מוק עם יעד מפורש (למשל מסלול הסירפנטינה: פינה שמאלית-תחתונה -> ימנית-
+  // עליונה) — משתמשים ישירות בנקודת היעד בעולם. אחרת: חוצים לדופן הנגדית.
+  if (world.goal) {
+    state.nav.goal = { x: world.goal.x, y: world.goal.y };
+    state.nav.mode = "seek";
+    state.nav.progressAnchor = null;
+    state.nav.moveAnchor = null;
+    state.nav.escapeUntil = 0;
+    state.avoidDir = 0;
+    return;
+  }
+
   const bx = state.pose.x;
   const by = state.pose.y;
   const HX = world.boundsHalfX || 600;
@@ -1362,6 +1393,28 @@ function drawWorld() {
     worldCtx.arc(p.x, p.y, Math.max(2, t.radius * scale), 0, Math.PI * 2);
     worldCtx.fillStyle = within ? "rgba(44, 255, 197, 0.85)" : "rgba(120, 140, 150, 0.5)";
     worldCtx.fill();
+  }
+
+  // Start / goal markers for scenarios that define them (e.g. the serpentine).
+  if (world.start) {
+    const s = toScreen(world.start.x, world.start.y);
+    worldCtx.strokeStyle = "rgba(120, 200, 255, 0.9)";
+    worldCtx.lineWidth = 2;
+    worldCtx.beginPath();
+    worldCtx.arc(s.x, s.y, 7, 0, Math.PI * 2);
+    worldCtx.stroke();
+  }
+  if (world.goal) {
+    const g = toScreen(world.goal.x, world.goal.y);
+    worldCtx.fillStyle = "rgba(255, 99, 132, 0.9)";
+    worldCtx.beginPath();
+    worldCtx.arc(g.x, g.y, 6, 0, Math.PI * 2);
+    worldCtx.fill();
+    worldCtx.strokeStyle = "rgba(255, 99, 132, 0.6)";
+    worldCtx.lineWidth = 2;
+    worldCtx.beginPath();
+    worldCtx.arc(g.x, g.y, 11, 0, Math.PI * 2);
+    worldCtx.stroke();
   }
 
   // Sensor beam directions in the world frame (heading + servo sweep + offset).
