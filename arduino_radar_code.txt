@@ -1,0 +1,89 @@
+//---------------- Configuration ----------------
+const byte TRIG_PIN = 12;
+
+const byte NUM_SENSORS = 4;
+const byte echoPins[NUM_SENSORS] = {13, 2, 10, 4}; // front, right, back, left
+
+const unsigned long MAX_ECHO_TIME = 38000UL;   // HC-SR04 max echo time (us)
+
+//------------------------------------------------
+
+long distanceCM[NUM_SENSORS];
+
+void triggerAll()
+{
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  digitalWrite(TRIG_PIN, LOW);
+
+  for (byte i = 0; i < NUM_SENSORS; i++)
+    pinMode(echoPins[i], INPUT);
+}
+
+void loop()
+{
+  triggerAll();
+
+  unsigned long riseTime[NUM_SENSORS] = {0};
+  unsigned long pulseWidth[NUM_SENSORS] = {0};
+  bool done[NUM_SENSORS] = {false};
+
+  unsigned long start = micros();
+
+  while (micros() - start < MAX_ECHO_TIME)
+  {
+    unsigned long now = micros();
+
+    for (byte i = 0; i < NUM_SENSORS; i++)
+    {
+      if (done[i]) continue;
+
+      bool state = digitalRead(echoPins[i]);
+
+      if (state)
+      {
+        if (riseTime[i] == 0)
+          riseTime[i] = now;
+      }
+      else
+      {
+        if (riseTime[i] != 0)
+        {
+          pulseWidth[i] = now - riseTime[i];
+          done[i] = true;
+        }
+      }
+    }
+  }
+
+  for (byte i = 0; i < NUM_SENSORS; i++)
+  {
+    if (pulseWidth[i] == 0)
+      distanceCM[i] = -1;
+    else
+      distanceCM[i] = pulseWidth[i] / 58;
+  }
+
+  for (byte i = 0; i < NUM_SENSORS; i++)
+  {
+    Serial.print(distanceCM[i]);
+    if (i < NUM_SENSORS - 1)
+      Serial.print(",");
+  }
+  Serial.println();
+
+  delay(500);
+}
+
