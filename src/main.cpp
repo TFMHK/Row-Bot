@@ -1,10 +1,17 @@
 #include <RH_ASK.h>
+#include <Servo.h>
 
-// רדיו: speed=2000bps, rxPin=7, txPin=6
-RH_ASK driver(2000, 7, 6);
+// רדיו: speed=2000bps, rxPin=7, txPin=4
+// (ה-TX עבר מ-D6 ל-D4 כדי לפנות את D6 ל-PWM של מנוע)
+RH_ASK driver(2000, 7, 4);
+
+// סרוו המכם על D3 (מונע על-ידי Timer1 דרך ספריית Servo)
+const int RADAR_SERVO_PIN = 3;
+Servo radarServo;
 
 // אולטרה-סוני: טריגר משותף ו-4 קווי Echo (המכם על A0 כדי לחסוך פין D)
-const int US_TRIG_PIN = 5;
+// הטריגר עבר מ-D5 ל-D2 כדי לפנות את D5 ל-PWM של מנוע
+const int US_TRIG_PIN = 2;
 const int US_ECHO_RADAR_PIN = A0;
 const int US_ECHO_FRONT_PIN = A1;
 const int US_ECHO_LEFT_PIN = A2;
@@ -12,14 +19,14 @@ const int US_ECHO_RIGHT_PIN = A3;
 const unsigned long US_TIMEOUT_US = 38000UL;
 
 // שני מנועים דרך H-Bridge
-// מנוע שמאל: כיוון D8/D9, מהירות PWM D10
+// מנוע שמאל: כיוון D8/D9, מהירות PWM D5 (Timer0)
 const int MOTOR1_IN1 = 8;
 const int MOTOR1_IN2 = 9;
-const int MOTOR1_PWM = 10;
-// מנוע ימין: כיוון D12/D13, מהירות PWM D11
+const int MOTOR1_PWM = 5;
+// מנוע ימין: כיוון D12/D13, מהירות PWM D6 (Timer0)
 const int MOTOR2_IN1 = 12;
 const int MOTOR2_IN2 = 13;
-const int MOTOR2_PWM = 11;
+const int MOTOR2_PWM = 6;
 
 struct CommandPacket {
   int leftSpeed;
@@ -57,6 +64,9 @@ void setup() {
   pinMode(US_ECHO_LEFT_PIN, INPUT);
   pinMode(US_ECHO_RIGHT_PIN, INPUT);
 
+  radarServo.attach(RADAR_SERVO_PIN);
+  radarServo.write(cmd.radarAngle);
+
   if (!driver.init()) {
     while (1);
   }
@@ -69,6 +79,10 @@ void loop() {
     memcpy(&cmd, buf, sizeof(CommandPacket));
     controlMotor(MOTOR1_IN1, MOTOR1_IN2, MOTOR1_PWM, cmd.leftSpeed);
     controlMotor(MOTOR2_IN1, MOTOR2_IN2, MOTOR2_PWM, cmd.rightSpeed);
+
+    // הזז את סרוו המכם לזווית המבוקשת ותן לו זמן להתייצב לפני הדגימה
+    radarServo.write(constrain(cmd.radarAngle, 0, 180));
+    delay(60);
 
     // בחומרת ASK פשוטה עדיף לענות אחרי קבלה במקום לשדר כל הזמן
     int usResults[4];

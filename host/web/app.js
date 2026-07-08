@@ -90,7 +90,7 @@ const state = {
 };
 
 const sim = {
-  maxRange: 450,
+  maxRange: 100,
 };
 
 // Ground-truth mock world (obstacle bodies + boundary), fetched once per mock
@@ -1319,8 +1319,32 @@ function drawRadar() {
   drawBoat(cx, cy);
   drawSensorArcs(cx, cy, maxR);
   drawSensorBeams(cx, cy, maxR);
+  drawRangeLabels(cx, cy, maxR);
 
   requestAnimationFrame(drawRadar);
+}
+
+// Distance scale: label each range ring with its real-world radius (cm). The
+// rings sit at 1/4 steps of maxR, which maps to sim.maxRange cm, so ring i marks
+// (sim.maxRange / 4) * i. Labels are placed on the north (up) axis and drawn
+// last so they stay readable on top of the sensor beams.
+function drawRangeLabels(cx, cy, maxR) {
+  radarCtx.save();
+  radarCtx.font = '11px system-ui, sans-serif';
+  radarCtx.textAlign = "center";
+  radarCtx.textBaseline = "middle";
+  for (let i = 1; i <= 4; i += 1) {
+    const r = (maxR / 4) * i;
+    const cm = Math.round((sim.maxRange / 4) * i);
+    const label = `${cm} ס"מ`;
+    const ty = cy - r;
+    const tw = radarCtx.measureText(label).width;
+    radarCtx.fillStyle = "rgba(0, 20, 16, 0.85)";
+    radarCtx.fillRect(cx - tw / 2 - 3, ty - 8, tw + 6, 16);
+    radarCtx.fillStyle = "rgba(120, 255, 210, 0.9)";
+    radarCtx.fillText(label, cx, ty);
+  }
+  radarCtx.restore();
 }
 
 // Top-down "ground truth" of the mock world: boundary walls, obstacle bodies,
