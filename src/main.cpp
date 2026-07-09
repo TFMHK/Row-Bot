@@ -9,6 +9,13 @@ RH_ASK driver(2000, 7, 4);
 const int RADAR_SERVO_PIN = 3;
 Servo radarServo;
 
+// סרוו הרשת על D10 (אותו Timer1 של Servo — בלי קונפליקט טיימר נוסף)
+const int NET_SERVO_PIN = 10;
+Servo netServo;
+// מעריך את cmd.winchSpeed (טווח שרת: -255..255) לזווית סרוו 0..180;
+// 0 = מרכז/ניטרלי (90°). מתאים לסרוו זוויתי וגם לסרוו רציף (90=עצירה).
+const int NET_SERVO_NEUTRAL = 90;
+
 // אולטרה-סוני: טריגר משותף ו-4 קווי Echo (המכם על A0 כדי לחסוך פין D)
 // הטריגר עבר מ-D5 ל-D2 כדי לפנות את D5 ל-PWM של מנוע
 const int US_TRIG_PIN = 2;
@@ -46,6 +53,12 @@ struct TelemetryPacket {
 CommandPacket cmd = {0, 0, 0, 90};
 TelemetryPacket telemetry;
 
+// Failsafe: אם לא מתקבלת פקודה תקינה תוך פרק הזמן הזה (למשל אובדן קשר RF),
+// המנועים נעצרים אוטומטית כדי שהסירה לא תמשיך לנוע "בעיוורון" עד לריסט.
+const unsigned long FAILSAFE_TIMEOUT_MS = 800;
+unsigned long lastCommandMs = 0;
+bool motorsStopped = true;
+
 void controlMotor(int in1, int in2, int pwmPin, int speed);
 void readAllUltrasonic(int results[4]);
 
@@ -67,6 +80,9 @@ void setup() {
   radarServo.attach(RADAR_SERVO_PIN);
   radarServo.write(cmd.radarAngle);
 
+  netServo.attach(NET_SERVO_PIN);
+  netServo.write(NET_SERVO_NEUTRAL);
+
   if (!driver.init()) {
     while (1);
   }
@@ -77,8 +93,14 @@ void loop() {
   uint8_t buflen = sizeof(CommandPacket);
   if (driver.recv(buf, &buflen) && buflen == sizeof(CommandPacket)) {
     memcpy(&cmd, buf, sizeof(CommandPacket));
+    lastCommandMs = millis();
+    motorsStopped = false;
     controlMotor(MOTOR1_IN1, MOTOR1_IN2, MOTOR1_PWM, cmd.leftSpeed);
     controlMotor(MOTOR2_IN1, MOTOR2_IN2, MOTOR2_PWM, cmd.rightSpeed);
+
+    // סרוו הרשת: ממפה מהירות -255..255 לזווית 0..180
+    int netAngle = map(constrain(cmd.winchSpeed, -255, 255), -255, 255, 0, 180);
+    netServo.write(netAngle);
 
     // הזז את סרוו המכם לזווית המבוקשת ותן לו זמן להתייצב לפני הדגימה
     radarServo.write(constrain(cmd.radarAngle, 0, 180));
@@ -94,6 +116,18 @@ void loop() {
     telemetry.radarAngle = cmd.radarAngle;
     driver.send((uint8_t*)&telemetry, sizeof(TelemetryPacket));
     driver.waitPacketSent();
+  }
+
+  // Failsafe watchdog: אם עברו יותר מ-FAILSAFE_TIMEOUT_MS בלי פקודה תקינה,
+  // עצור את המנועים פעם אחת (millis() בחשבון unsigned עמיד ל-overflow).
+  if (!motorsStopped && (millis() - lastCommandMs > FAILSAFE_TIMEOUT_MS)) {
+    controlMotor(MOTOR1_IN1, MOTOR1_IN2, MOTOR1_PWM, 0);
+    controlMotor(MOTOR2_IN1, MOTOR2_IN2, MOTOR2_PWM, 0);
+    netServo.write(NET_SERVO_NEUTRAL);
+    cmd.leftSpeed = 0;
+    cmd.rightSpeed = 0;
+    cmd.winchSpeed = 0;
+    motorsStopped = true;
   }
 }
 

@@ -515,7 +515,11 @@ function applyRemoteState(remoteState, syncCmd = false) {
     boatY: remoteState.telemetry.boatY ?? 0,
     boatHeadingDeg: remoteState.telemetry.boatHeadingDeg ?? 0,
   };
-  state.lastRadarAngleSent = remoteState.telemetry.radarAngle ?? state.cmd.radarAngle;
+  // The PC is the authoritative source of the sweep (it runs advanceRadarSweep
+  // and commands the servo). The boat only echoes it back in telemetry, so if
+  // that return path stalls the echoed angle freezes while the servo keeps
+  // spinning. Trust the commanded angle so the display always tracks the servo.
+  state.lastRadarAngleSent = state.cmd.radarAngle ?? remoteState.telemetry.radarAngle ?? 0;
 
   if (syncCmd) {
     // תרחישי מוק יכולים להתחיל את הסירה בכל מקום (למשל פינה). מזריעים את מסגרת
@@ -1442,7 +1446,9 @@ function drawWorld() {
   }
 
   // Sensor beam directions in the world frame (heading + servo sweep + offset).
-  const sweep = state.telemetry.radarAngle ?? 0;
+  // Use the commanded sweep (what the PC drives the servo to) so the beams turn
+  // in lockstep with the physical servo even if telemetry echo stalls.
+  const sweep = state.cmd.radarAngle ?? 0;
   worldCtx.strokeStyle = "rgba(255, 241, 118, 0.35)";
   worldCtx.lineWidth = 1;
   for (const beam of SENSOR_BEAMS) {
@@ -1478,7 +1484,7 @@ function drawWorld() {
 // measured range). Also clears the empty cone in front of the arc and records
 // the boat's path (trail). Cells only become "real" where arcs intersect.
 function accumulateRadarMap() {
-  const sweep = state.telemetry.radarAngle ?? 0;
+  const sweep = state.cmd.radarAngle ?? 0;
   const heading = state.pose.headingDeg;
   const bx = state.pose.x;
   const by = state.pose.y;
@@ -1803,7 +1809,7 @@ function updateRadarMemory() {
   // boat's heading. Store each reading at its ABSOLUTE world bearing so that a
   // rotating boat leaves the world fixed in place (the radar view then rotates
   // the world back around the boat at draw time, keeping the bow pointing up).
-  const sweep = state.telemetry.radarAngle ?? 0;
+  const sweep = state.cmd.radarAngle ?? 0;
   const heading = state.pose.headingDeg;
   const bx = state.pose.x;
   const by = state.pose.y;
@@ -1906,7 +1912,7 @@ function drawSensorArcs(cx, cy, maxR) {
 
 function drawSensorBeams(cx, cy, maxR) {
   const fovHalf = 7.5;
-  const sweep = state.telemetry.radarAngle ?? 0;
+  const sweep = state.cmd.radarAngle ?? 0;
   radarCtx.save();
   radarCtx.lineWidth = 1.5;
   for (const beam of SENSOR_BEAMS) {

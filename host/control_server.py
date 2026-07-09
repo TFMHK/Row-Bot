@@ -21,6 +21,11 @@ from serial.tools import list_ports
 ROOT_DIR = Path(__file__).resolve().parent
 WEB_DIR = ROOT_DIR / "web"
 
+# How often the server re-sends the last command over serial while connected.
+# Must be shorter than the Arduino's FAILSAFE_TIMEOUT_MS (800ms) so that a
+# stationary boat under active control is never mistaken for a lost link.
+HEARTBEAT_INTERVAL_S = 0.25
+
 
 def clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
@@ -65,6 +70,7 @@ class SerialBridge:
         self._reader_thread: threading.Thread | None = None
         self._stop_reader = threading.Event()
         self._mock_thread = threading.Thread(target=self._mock_loop, daemon=True)
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._state = BridgeState()
 
         # SSE fan-out: every connected stream client owns a bounded queue that
@@ -88,6 +94,7 @@ class SerialBridge:
         self._sim_goal: dict | None = None
 
         self._mock_thread.start()
+        self._heartbeat_thread.start()
 
     def list_ports(self) -> list[str]:
         return [port.device for port in list_ports.comports()]
@@ -307,6 +314,31 @@ class SerialBridge:
                 )
                 self._state.lastError = ""
                 self._publish()
+
+    def _heartbeat_loop(self) -> None:
+        """Periodically re-send the last command so the boat's failsafe stays armed.
+
+        The Arduino stops its motors if no valid packet arrives within its
+        failsafe window. Without a heartbeat, a boat that is told "go forward"
+        and then left alone would be halted by the watchdog. Re-transmitting the
+        current command keeps the RF link alive so the boat keeps doing exactly
+        what the UI last asked, while a genuine link loss still trips the failsafe.
+        """
+        while True:
+            time.sleep(HEARTBEAT_INTERVAL_S)
+            with self._lock:
+                ser = self._serial
+                if ser is None or not ser.is_open:
+                    continue
+                command = self._state.command
+                line = (
+                    f"{command.leftSpeed},{command.rightSpeed},"
+                    f"{command.winchSpeed},{command.radarAngle}\n"
+                )
+                try:
+                    ser.write(line.encode("ascii"))
+                except Exception:
+                    pass
 
     def _mock_loop(self) -> None:
         import random
