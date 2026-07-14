@@ -29,6 +29,11 @@ const mapCanvas = document.getElementById("mapCanvas");
 const mapCtx = mapCanvas.getContext("2d");
 const mapPointsValue = document.getElementById("mapPointsValue");
 const mapClearBtn = document.getElementById("mapClearBtn");
+// The mock world picture and the accumulated radar map are meaningful ONLY in
+// mock mode (both rely on the simulator's dead-reckoned world pose). On a real
+// boat they show stale/garbage, so the whole panels are hidden off-mock.
+const worldPanel = worldCanvas.closest(".world-panel");
+const mapPanel = mapCanvas.closest(".map-panel");
 
 const state = {
   connected: false,
@@ -41,7 +46,7 @@ const state = {
   sendingCommand: false,
   lastRadarAngleSent: 0,
   radarSweepDir: 1,
-  lastRadarStepTime: 0,
+  radarStepTick: 0,
   manualMode: true,
   // Committed autonomous avoidance turn: 0 = none, -1 = turning left, +1 = right.
   avoidDir: 0,
@@ -50,7 +55,7 @@ const state = {
   // שחומרה אמיתית תעשה (אין GPS/מצפן על החוט), ולכן כל מחסנית התפיסה+הניווט רצה
   // על פוזה משוערת בסימולטור ובמציאות גם יחד — אם זה עובד בסימולטור, זה יעבוד במים.
   // (בסימולטור האומדן עוקב אחר אמת-השרת; boatX/Y/heading משמשים רק לתצוגת אמת לדיבאג.)
-  pose: { x: 0, y: 0, headingDeg: 0, speedCms: 0 },
+  pose: { x: 0, y: 0, headingDeg: 0, speedCms: 0, turnRateRadS: 0 },
   lastPoseT: 0,
   // ניווט מוכוון-יעד (הגעה לקצה השני של הבריכה). מכונת מצבים:
   //   "seek"    - follow-the-gap מוטה אל היעד
@@ -65,6 +70,15 @@ const state = {
     moveAnchor: null,      // {x, y, t} תצלום פוזה לגילוי תקיעה פיזית (חוסר תזוזה)
     escapeUntil: 0,        // חותמת-זמן: עד מתי מבצעים תמרון-חילוץ בנסיעה לאחור
     escapeDir: 0,          // כיוון הפנייה בזמן החילוץ (-1 שמאל, +1 ימין)
+    // --- ניווט עולם-אמיתי (מכ"ם מיידי, ללא פוזה) ---
+    bowOffsetDeg: 60,      // כיוון החרטום במסגרת הגלם (סרבו+חיישן); נלמד מקוון תוך תנועה
+    bowLocked: false,      // האם מעריך-החרטום המקוון התכנס בנסיעה הזו
+    rwPhase: "calib",      // "calib" = פעימת-זרע ישרה ללימוד חרטום, "run" = follow-the-gap
+    calibActive: false,    // תאימות-לאחור (לא בשימוש עוד)
+    calibStart: 0,         // חותמת-זמן תחילת פעימת-הזרע
+    // --- פולסי-סיבוב קצרים (סיבוב במקום בציר 0, לא קשתות) ---
+    spinUntil: 0,          // חותמת-זמן: עד מתי הפולס הנוכחי מסובב במקום
+    settleUntil: 0,        // חותמת-זמן: עד מתי מיישרים/עוצרים בין פולסים
   },
   telemetry: {
     usRadar: null,
@@ -102,23 +116,47 @@ const world = {
   boundsHalfY: 450,
   maxRange: 450,
   targets: [],
+  walls: [],     // מכשולי קו-ישר דקים {x1,y1,x2,y2,thickness}
   scenario: null,
   start: null,   // {x, y} נקודת התחלה בעולם (תרחיש מוק)
   goal: null,    // {x, y} נקודת היעד בעולם (תרחיש מוק)
 };
 
-const CONTROL_INTERVAL_MS = 80;
+const CONTROL_INTERVAL_MS = 250;
 const POLL_INTERVAL_MS = 500;
 
 // --- מודל אודומטריה (dead-reckoning) — זהה למודל הפיזיקלי של _mock_loop בשרת ---
 // על ידי אינטגרציה של אותן פקודות שאנו שולחים מקבלים אומדן פוזה הזהה למה שהסירה
 // האמיתית תעשה. הערכים חייבים להיות זההים לשרת כדי שהאומדן יישאר צמוד לאמת בסימולטור.
-const DR_MAX_SPEED_CMS = 45;          // target_speed = throttle * 45 (גבול פיזיקלי)
-const DR_ACCEL_GAIN = 0.24;           // החלקת תאוצה לעבר מהירות היעד
-const DR_TURN_RATE = Math.PI * 0.25;  // rad/s בסיבוב מלא
+const DR_MAX_SPEED_CMS = 45;          // מהירות שיוט יציבה במלוא המצערת (גבול הולל)
+const DR_TURN_RATE = Math.PI * 0.25;  // rad/s — קצב סחרור יציב בהיגוי דיפרנציאלי מלא
+// תנע: הכלי אינו נקודה קינמטית. הדחף מהמנועים נאבק בגרר המים, ולכן הכלי ממשיך
+// להחליק אחרי שחרור המצערת וזקוק לזמן להאיץ/להסתובב. הקבועים זהים לשרת
+// (MOCK_LINEAR_DRAG / MOCK_TURN_DRAG ב-control_server.py) כדי שהאומדן יישאר צמוד לאמת.
+const DR_LINEAR_DRAG = 1.4;           // 1/s — קבוע זמן שיוט ~0.7 שנ'
+const DR_TURN_DRAG = 2.5;             // 1/s — קבוע זמן סחרור ~0.4 שנ'
+// דירוג כוח המנוע לפי ערך מוחלט (shape_motor_speed בשרת), מוחל גם באוטונומי וגם
+// בידני:
+//   |v| < 35  -> 0   (אזור-מת: חלש מדי -> מנוע כבוי)
+//   אחרת      -> נחתך לרצועת הכוח השמישה [70, 100] (רציף)
+// סקאלת השליטה של המשתמש היא רצועת 70..100 הזו; הכיוון (הסימן) נשמר. חייבים
+// לשקף כאן את אותה עיצוב כדי שהאומדן יישאר צמוד לאמת — וכדי שגם הניווט האוטונומי
+// (שנוהג דרך אותה פיזיקה) יעבוד באותה רצועה.
+// כוח המנוע מוגבל ל-3 מצבים בלבד לכל מנוע: 80 / -80 / 0 (מוחל גם באוטונומי וגם
+// בידני). כל ערך פקודה נחתך למדרג הזה — עוצמה מתחת לאזור-המת מכובה, וכל השאר
+// מקובע לעוצמה היחידה MOTOR_SPEED תוך שמירת הסימן (כיוון).
+const MOTOR_DEADZONE = 40;    // מתחת לעוצמה זו -> 0 (כבוי)
+const MOTOR_SPEED = 80;       // העוצמה היחידה בכל מנוע (80 קדימה / -80 אחורה)
+function shapeMotorSpeed(value) {
+  if (Math.abs(value) < MOTOR_DEADZONE) return 0;
+  return value > 0 ? MOTOR_SPEED : -MOTOR_SPEED;
+}
 // מהירות שיוט אוטונומית. מכוונת בכוונה נמוכה יחסית כדי שהמכ"ם הסורק (מסתובב על
 // סרבו, מכסה את המעגל ב~1 שנייה) תמיד "מדביק" גופים שנכנסים לחזית לפני מגע —
 // במהירות גבוהה הסירה עלולה לחצות פער-סריקה ולהיכנס לגוף שטרם נסרק.
+// עוצמת הניווט נשלחת בסולם המלא (עד 255) והעיצוב חותך אותה לרצועת
+// כוח המנוע {0} ∪ [70, 100] (shapeMotorSpeed ב-computeSafeCommand/integratePose +
+// shape_motor_speed בשרת), כך שבפועל המנוע רץ ברצועה הזו — גם באוטונומי.
 const AUTONOMOUS_SPEED = 135;
 // Slowest forward speed while threading past a nearby obstacle. Easing down to
 // this as the bow closes in gives the servo sweep time to refresh the picture
@@ -128,11 +166,15 @@ const AVOID_SPEED = 170;
 // Below this front distance the boat commits to spinning in place toward open
 // water. It keeps spinning (hysteresis) until the bow is clear past
 // CLEAR_DISTANCE_CM, so it never chatters on/off right at one threshold.
-const SAFE_DISTANCE_CM = 70;
-const CLEAR_DISTANCE_CM = 130;
+// המרחק נמדד ממרכז הסירה; הסירה באורך 30 ס"מ (חצי-אורך 15), לכן ערך של 40 ס"מ
+// משאיר ~25 ס"מ אוויר בין דופן-הסירה לקיר.
+const SAFE_DISTANCE_CM = 40;
+const CLEAR_DISTANCE_CM = 64;
 // While cruising, start gently steering away from an obstacle this far ahead so
 // the boat arcs around it smoothly instead of charging up and hard-spinning.
-const STEER_LOOKAHEAD_CM = 220;
+const STEER_LOOKAHEAD_CM = 100;
+// עוצמת ההיגוי המרבית. הפקודות נשלחות בסולם המלא ומעוצבות בפיזיקה לרצועת הכוח
+// {0}∪[40,100], כך שסיבוב חד מעביר את הגלגל הפנימי לאחור לפיבוט תוך כדי שיוט.
 const STEER_MAX = 120;
 // --- ניווט יזום לעבר מרחב פתוח ("follow the gap") ---
 // במקום לחכות שהחרטום ייחסם ואז להתחמק, הניווט סורק את קשת החזית ובוחר בכל רגע
@@ -142,7 +184,7 @@ const STEER_MAX = 120;
 const OPEN_SCAN_DEG = 85;        // סורקים ±זווית זו סביב החרטום (קשת חזית)
 const OPEN_SCAN_STEP = 10;       // צעד הסריקה במעלות
 const OPEN_SCAN_TOL = 12;        // סובלנות זוויתית לכל כיוון-מועמד (חופף לצעד)
-const OPEN_CLEAR_CAP = 320;      // ס"מ - מעבר לזה כיוון "פתוח מספיק" (לא מתגמל עוד)
+const OPEN_CLEAR_CAP = 110;      // ס"מ - מעבר לזה כיוון "פתוח מספיק" (לא מתגמל עוד)
 const OPEN_TURN_PENALTY = 0.5;   // ס"מ קנס לכל מעלת סטייה מהחרטום (מאזן בין
                                  // "להמשיך ישר" ל"לפנות אל הפתוח") — פונה חזק רק
                                  // אם הכיוון הפתוח פנוי משמעותית יותר.
@@ -152,62 +194,98 @@ const OPEN_STEER_GAIN = 1.5;     // ממיר זווית-יעד (מעלות) לע
 // המוצא קרוב לאחת הדפנות; היעד הוא הדופן שממול. הסירה נמשכת אל היעד (איבר משיכה
 // ב-follow-the-gap), ואם היא נתקעת (חוסר התקדמות נטו) היא עוברת לעקיבת קו-מתאר
 // בסגנון Bug2 שמובטח שיחלץ אותה ממלכודות קעורות/פינות — ואז חוזרת לשיוט אל היעד.
-const GOAL_MARGIN_CM = 60;        // עד כמה מהקיר הרחוק ממקמים את נקודת היעד
-const GOAL_ARRIVE_CM = 90;        // מרחק מהיעד שנחשב "הגענו" -> עצירה
-const GOAL_ATTRACT_PENALTY = 0.9; // ס"מ קנס לכל מעלת סטייה מכיוון היעד (מחליף את
+const GOAL_MARGIN_CM = 48;        // עד כמה מהקיר הרחוק ממקמים את נקודת היעד
+const GOAL_ARRIVE_CM = 40;        // מרחק מהיעד שנחשב "הגענו" -> עצירה
+const GOAL_ATTRACT_PENALTY = 2.0; // ס"מ קנס לכל מעלת סטייה מכיוון היעד (מחליף את
                                   // OPEN_TURN_PENALTY במצב seek -> מטה אל היעד)
-// גלאי-תקיעה: אם ההתקדמות נטו אל היעד קטנה מ-STUCK_PROGRESS_CM בתוך חלון הזמן,
-// מניחים שנתקענו במינימום מקומי ועוברים לעקיבת-דופן.
-const STUCK_WINDOW_MS = 4000;
-const STUCK_PROGRESS_CM = 40;
+// כמה "לצדד" אל היעד: כשעדיין רחוקים ממנו אנכית, נקודת-הכיוון מתקרבת אל מעל
+// הסירה (טיפוס כמעט-אנכי דרך הפערים; ההתחמקות הריאקטיבית מטפלת בעיקוף הדפנות),
+// וככל שמתקרבים ליעד אנכית המשיכה הצדדית גדלה עד לכיוון אל היעד עצמו. זה מונע
+// מהמשיכה-אל-פינת-היעד למשוך את הסירה לתוך דופן-הצד לפני שחצתה את הפער.
+const GOAL_LATERAL_RANGE = 70;   // ס"מ - סקאלת מרחק-אנכי למשיכה הצדדית
+// ציר-האורך (x) של הערוץ המשותף שכל פערי-המחסומים חופפים בו. המחסומים
+// סימטריים סביב מרכז הבריכה (ראשית x=0), לכן טיפוס אנכי ב-x=0 חוצה את שלושת
+// המחסומים בבטחה. רק לקרבת היעד מסיטים אל עמודת-ה-x שלו.
+const CHANNEL_CENTER_X = 0;
+// גלאי-תקיעה: מודד תזוזה *מרחבית נטו* (לא ירידה במרחק-האווירי-ליעד). מסלול תקין
+// סביב מכשול/מחיצה מחייב לעיתים להתרחק מהיעד לאורך זמן (המרחק-האווירי גדל), ולכן
+// מדד מבוסס-מרחק-ליעד היה מזהה "תקיעה" בטעות בכל עיקוף. במקום זה: אם הסירה לא זזה
+// במרחב יותר מ-STUCK_TRAVEL_CM נטו בתוך חלון הזמן — היא באמת לכודה (מסתובבת סביב
+// עצמה במינימום מקומי) ורק אז עוברים לעקיבת-דופן. עיקוף פרודוקטיבי צובר תזוזה
+// מרחבית גדולה ולכן לעולם לא מפעיל אותו.
+const STUCK_WINDOW_MS = 6000;
+const STUCK_TRAVEL_CM = 38;
 // חילוץ מתקיעה פיזית (deadlock): סיבוב-במקום אינו מזיז את הסירה כלל, כך שאם היא
 // "כלואה" (כל כיוון בר-השגה חסום בטווח SAFE) היא עלולה להתנדנד לנצח בלי שמיקומה
 // ישתנה — והמכשול שלפניה יישאר באותו מרחק. לכן אם אין תזוזה נטו מעבר ל-
 // ESCAPE_MOVE_CM בתוך ESCAPE_STALL_MS, מבצעים תמרון-חילוץ: נסיעה לאחור בקשת אל
 // הצד הפתוח, שמייצרת תזוזה אמיתית ופותחת מרחב מלפנים. אמין וגם ריאל-טרנספרבילי.
 const ESCAPE_STALL_MS = 2600;    // אין תזוזה כזמן הזה -> נכנסים לחילוץ
-const ESCAPE_MOVE_CM = 25;       // תזוזה נטו מעבר לזה מאפסת את שעון-התקיעה
+const ESCAPE_MOVE_CM = 14;       // תזוזה נטו מעבר לזה מאפסת את שעון-התקיעה
 const ESCAPE_DURATION_MS = 1400; // משך פרץ הנסיעה-לאחור
 const ESCAPE_SPEED = 130;        // עוצמת נסיעה לאחור (שני המנועים)
 const ESCAPE_TURN = 55;          // הפרש-היגוי בזמן החילוץ (מטה את הקשת לצד הפתוח)// מצב עקיבת-דופן (Bug2): בקר-P שומר מרחק-סף קבוע מהדופן/גוף עד שכיוון היעד נפתח.
-const WALL_FOLLOW_STANDOFF_CM = 90;
+const WALL_FOLLOW_STANDOFF_CM = 45;
 const WALL_FOLLOW_SPEED = 120;
 const WALL_FOLLOW_GAIN = 1.2;     // המרה משגיאת-מרחק (ס"מ) לעוצמת היגוי
-const WALL_LEAVE_CLEAR_CM = 200;  // כיוון היעד נחשב "פתוח" מעל מרחק פנוי זה -> עזיבה
+const WALL_LEAVE_CLEAR_CM = 100;  // כיוון היעד נחשב "פתוח" מעל מרחק פנוי זה -> עזיבה
 // How often the servo advances one sweep step. The four sensors are only 15°
 // wide and sit 90° apart, so at any instant they cover just 4×15°=60° of the
 // full circle — everything else is a momentary blind gap. The ONLY thing that
-// fills those gaps is the sweep, so it must be fast: a body dead ahead has to be
-// swept over (and thus seen) before the boat can reach it. At 80ms/step a full
-// 0..90..0 servo cycle (~12 steps) scans the entire 360° in ~1s, which at cruise
-// speed is only ~60cm of travel — tight enough that head-on bodies are caught
-// well before contact. (Slower sweeps let the boat charge into gaps unseen.)
-const RADAR_STEP_INTERVAL_MS = 80;
-// A slot's reading is trusted for this long after it was last measured. A full
-// 0..90..0 sweep cycle (~12 steps × RADAR_STEP_INTERVAL_MS ≈ 1 s) refreshes every
-// bearing at least once, and the turnaround slots (0° and 90°) once per cycle, so
-// the TTL only needs to comfortably exceed that cycle time (plus network/servo
-// lag) — 5 s leaves a very wide margin so no slot ever expires before its refresh.
-const RADAR_TTL_MS = 5000;
+// fills those gaps is the sweep. The servo steps 0→15→30→45→60→75 then back
+// 75→60→45→30→15→0 (six 15° slots). The sweep advances one 15° slot every
+// RADAR_STEP_EVERY_TICKS *sent* commands, so the rotation rate is perfectly
+// even and tied to the data cadence (one fresh angle per sample) instead of a
+// wall-clock timer that drifted against the loop and produced uneven jumps.
+// At CONTROL_INTERVAL_MS=300ms and 1 tick/step that's ~300ms/slot, so a full
+// 0..75..0 cycle (~10 steps) takes ~3s.
+const RADAR_STEP_EVERY_TICKS = 1;
+// A slot's reading is trusted for this long after it was last measured, then it
+// vanishes from the picture. The lifetime is deliberately ONE back-and-forth
+// sweep cycle: the servo walks 0..75..0 in ten 15° steps, so at
+// CONTROL_INTERVAL_MS=250ms a full round trip is ~2.5s. A short TTL (~3s, just
+// over one cycle) means each blip lives for exactly one sweep and then expires —
+// so moved/phantom returns don't linger as stale rings while every bearing is
+// still refreshed at least once before it dies.
+const RADAR_TTL_MS = 3000;
+
+// --- סינון חציון לרעש חיישנים (חומרה מחזירה שגיאות מדידה) --------------------
+// חומרה אמיתית זורקת מדי פעם קריאה שגויה: dropout (999) או קפיצת-רפאים קצרה,
+// ומעל הכל רעש מדידה של כמה ס"מ. חציון על 3 הקריאות האחרונות של כל ערוץ דוחה
+// חריגים בודדים (הן dropout והן spike) לפני שהניווט/המפה מגיבים אליהם, מבלי
+// לעכב זיהוי מכשול אמיתי ביותר מ~2 טיקים (~100ms).
+const SENSOR_MEDIAN_WINDOW = 3;
+const _sensorHistory = { usFront: [], usRight: [], usRadar: [], usLeft: [] };
+function filterSensorReading(key, raw) {
+  const hist = _sensorHistory[key];
+  if (!hist || raw == null) return raw;
+  hist.push(raw);
+  if (hist.length > SENSOR_MEDIAN_WINDOW) hist.shift();
+  const sorted = [...hist].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
+}
+function resetSensorHistory() {
+  for (const key of Object.keys(_sensorHistory)) _sensorHistory[key].length = 0;
+}
 
 // שכבת הגנה והתחמקות אקטיבית
 // רשת הביטחון האחרונה חייבת להיות פנימית לטווח שבו הניווט האוטונומי כבר מתחמק
 // (SAFE_DISTANCE_CM = 70). אחרת שכבת הבטיחות "חוטפת" את ההגה מהניווט לפני שהוא
 // מספיק לתמרן, ושני הבקרים נלחמים ומייצרים זיג-זג. לכן טווח האזהרה קטן מ-70.
-const AVOID_SAFETY_RADIUS = 28;  // ס"מ - קו אדום ל-J-Turn, אסור לסירה להיות במרחק כזה ממכשול
-const AVOID_WARNING_RADIUS = 50; // ס"מ - טווח הדיפה (קטן מ-SAFE_DISTANCE_CM כדי לתת לניווט להתחמק קודם)
+const AVOID_SAFETY_RADIUS = 18;  // ס"מ - קו אדום ל-J-Turn, אסור לסירה להיות במרחק כזה ממכשול
+const AVOID_WARNING_RADIUS = 23; // ס"מ - טווח הדיפה (קטן מ-SAFE_DISTANCE_CM כדי לתת לניווט להתחמק קודם)
 // ניפוח מכשולים (Obstacle Inflation): הניווט מתייחס לסירה כאל נקודה, אך לגוף יש
 // אורך פיזי וציר-הסיבוב אינו ממורכז — בסיבוב-במקום זנב הסירה "מטאטא" קשת ועלול
 // לפגוע במכשול שהחרטום פינה. לכן מנפחים כל מכשול ברדיוס = חצי אורך הסירה + מרווח
 // ביטחון, ומקזזים אותו ממרחק-הפנוי שהניווט רואה. כך כל שכבת התכנון (בחירת כיוון
 // פתוח, ספי התחמקות, עקיבת-דופן) שומרת על מעטפת הגוף במקום על נקודה בודדת.
-const OBSTACLE_INFLATION_CM = 30;
+const OBSTACLE_INFLATION_CM = 7;
 // מושל מהירות קדימה: אסור לדהור לעבר מכשול שזוהה מהר מכפי שאפשר לפנות ממנו.
 // המהירות קדימה נחתכת כפונקציה של המרחק הפנוי בחרוט שלפני החרטום, כך שגוף חזיתי
 // דוחף את המצערת לאפס הרבה לפני מגע — הסירה עדיין יכולה להסתובב במקום ולחפש פתח,
 // אבל פיזית אינה יכולה להתקדם לתוך גוף. פועל גם בשליטה ידנית וגם באוטונומית.
-const GOVERNOR_RANGE_CM = 150;    // ס"מ - מתחילים להאט מהמרחק הזה
-const GOVERNOR_STOP_CM = 48;      // ס"מ - מהירות קדימה מתאפסת במרחק (משטח) הזה
+const GOVERNOR_RANGE_CM = 85;    // ס"מ - מתחילים להאט מהמרחק הזה
+const GOVERNOR_STOP_CM = 24;      // ס"מ - מהירות קדימה מתאפסת במרחק (משטח) הזה
 const GOVERNOR_FWD_CONE_DEG = 32; // חרוט צר סביב החרטום בלבד — רק מכשול כמעט-חזיתי
                                   // מגביל מהירות. כל ההיגוי (חיפוש מרחב פתוח
                                   // והתחמקות) מטופל ע"י שכבת הניווט, כך שהמושל לא
@@ -381,16 +459,26 @@ function startCommandLoop() {
     if (!state.manualMode) {
       updateAutonomousCommand();
     }
-    const now = Date.now();
-    if (now - state.lastRadarStepTime >= RADAR_STEP_INTERVAL_MS) {
+    // Advance the sweep once every RADAR_STEP_EVERY_TICKS *sent* commands rather
+    // than by wall-clock. The old Date.now() gate fired on whichever loop tick
+    // first crossed the threshold; because the loop skips ticks while a previous
+    // send is still in flight (state.sendingCommand) and 300ms/400ms don't
+    // divide evenly, the step landed on uneven 300/600ms+ gaps — the visible
+    // jump in rotation. Counting actual sends keeps the angular rate constant
+    // and locked to the data cadence (one fresh angle per sample).
+    state.radarStepTick += 1;
+    if (state.radarStepTick >= RADAR_STEP_EVERY_TICKS) {
       advanceRadarSweep();
-      state.lastRadarStepTime = now;
+      state.radarStepTick = 0;
     }
 
     // === יירוט ודריסת פקודות היגוי לצורך בטיחות ===
     // הדריסה מחושבת על עותק בלבד, כך שברגע שיוצאים מהטווח הכתום
     // השליטה חוזרת מיד לניווט האוטונומי/השליטה הידנית.
     const outgoing = computeSafeCommand();
+
+    // Record the full I/O + decision of this autonomous tick for later analysis.
+    if (!state.manualMode) recordNavTick(outgoing);
 
     // אודומטריה: מקדמים את אומדן הפוזה לפי הפקודה הנשלחת, כך שהתפיסה+הניווט
     // רצים על פוזה משוערת (ריאל-טרנספרבילית) ולא על אמת-שרת שקיימת רק בסימולטור.
@@ -416,6 +504,92 @@ function stopCommandLoop() {
     state.commandLoopId = null;
   }
 }
+
+// --- Autonomous-run recorder ------------------------------------------------
+// Captures, once per autonomous tick, what the boat SENT (telemetry/sensors),
+// what it RECEIVES (the motor command), and what the navigator PERCEIVED and
+// DECIDED (bow offset, phase, bow-relative cones, chosen escape bearing). The
+// records are batched to /api/navlog so a run is saved to disk for later
+// analysis even if the phone/browser is closed. Nothing is logged in manual
+// mode or when idle/disconnected.
+const navLogPending = [];
+let navLogFlushing = false;
+let navLogResetPending = false;
+
+function startNavLogSession() {
+  // Rotate to a fresh log file on the next flush (new experiment = new file).
+  navLogPending.length = 0;
+  navLogResetPending = true;
+  flushNavLog();
+}
+
+function recordNavTick(outgoing) {
+  const t = state.telemetry || {};
+  const fc = liveCone(0, RW_FRONT_CONE_DEG);
+  const lc = liveCone(-RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
+  const rc = liveCone(RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
+  const esc = bestOpenBearing(-180, 180);
+  navLogPending.push({
+    t: Date.now(),
+    mock: state.mockEnabled,
+    phase: state.nav.rwPhase,
+    bowOffsetDeg: Math.round((state.nav.bowOffsetDeg ?? 0) * 10) / 10,
+    bowLocked: !!state.nav.bowLocked,
+    avoidDir: state.avoidDir | 0,
+    headingDeg: Math.round(state.pose.headingDeg || 0),
+    // What the boat SENT this frame (raw sensors + servo angle it echoed).
+    tel: {
+      usFront: t.usFront ?? null,
+      usRight: t.usRight ?? null,
+      usRadar: t.usRadar ?? null,
+      usLeft: t.usLeft ?? null,
+      radarAngle: t.radarAngle ?? null,
+      boatHeadingDeg: t.boatHeadingDeg ?? null,
+      stale: t.stale ?? null,
+    },
+    // What the boat RECEIVES (the motor/servo command we are about to send).
+    cmd: {
+      left: outgoing.leftSpeed,
+      right: outgoing.rightSpeed,
+      radarAngle: outgoing.radarAngle,
+    },
+    // What the navigator PERCEIVED (bow-relative, 1 m-capped) and its decision.
+    perc: {
+      front: fc,
+      left: lc,
+      right: rc,
+      bestBearing: esc.bearing,
+      bestClear: esc.clear,
+      arcCount: esc.count,
+    },
+  });
+  if (navLogPending.length >= 8) flushNavLog();
+}
+
+function flushNavLog() {
+  if (navLogFlushing) return;
+  if (navLogPending.length === 0 && !navLogResetPending) return;
+  const batch = navLogPending.splice(0, navLogPending.length);
+  const reset = navLogResetPending;
+  navLogResetPending = false;
+  navLogFlushing = true;
+  postJson("/api/navlog", { records: batch, reset })
+    .catch(() => {
+      // Re-queue on failure so nothing is lost; the reset marker too.
+      for (let i = batch.length - 1; i >= 0; i--) navLogPending.unshift(batch[i]);
+      if (reset) navLogResetPending = true;
+    })
+    .finally(() => {
+      navLogFlushing = false;
+    });
+}
+
+// Make sure the tail of a run reaches disk when the tab is hidden/closed.
+window.addEventListener("beforeunload", flushNavLog);
+window.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") flushNavLog();
+});
+
 
 async function refreshPorts() {
   try {
@@ -456,6 +630,7 @@ async function ensureWorldLoaded() {
   if (!state.mockEnabled) {
     world.loaded = false;
     world.targets = [];
+    world.walls = [];
     world.start = null;
     world.goal = null;
     return;
@@ -468,6 +643,7 @@ async function ensureWorldLoaded() {
     world.boundsHalfY = w.boundsHalfY ?? world.boundsHalfY;
     world.maxRange = w.maxRange ?? world.maxRange;
     world.targets = Array.isArray(w.targets) ? w.targets : [];
+    world.walls = Array.isArray(w.walls) ? w.walls : [];
     world.scenario = w.scenario ?? null;
     world.start = w.start ?? null;
     world.goal = w.goal ?? null;
@@ -502,24 +678,26 @@ function applyRemoteState(remoteState, syncCmd = false) {
     // stale detections from a previous (possibly re-randomised) world are gone.
     clearRadarMap();
     resetPose();
+    resetSensorHistory();
   }
 
-  // Always use backend telemetry (both real and mock modes).
+  // Always use backend telemetry (both real and mock modes). Each ultrasonic
+  // channel is despeckled with a 3-sample median first, so a lone dropout (999)
+  // or phantom short spike from the hardware never reaches the nav/map/UI.
   state.telemetry = {
-    usRadar: remoteState.telemetry.usRadar,
-    usFront: remoteState.telemetry.usFront,
-    usLeft: remoteState.telemetry.usLeft,
-    usRight: remoteState.telemetry.usRight,
+    usRadar: filterSensorReading("usRadar", remoteState.telemetry.usRadar),
+    usFront: filterSensorReading("usFront", remoteState.telemetry.usFront),
+    usLeft: filterSensorReading("usLeft", remoteState.telemetry.usLeft),
+    usRight: filterSensorReading("usRight", remoteState.telemetry.usRight),
     radarAngle: remoteState.telemetry.radarAngle,
     boatX: remoteState.telemetry.boatX ?? 0,
     boatY: remoteState.telemetry.boatY ?? 0,
     boatHeadingDeg: remoteState.telemetry.boatHeadingDeg ?? 0,
   };
-  // The PC is the authoritative source of the sweep (it runs advanceRadarSweep
-  // and commands the servo). The boat only echoes it back in telemetry, so if
-  // that return path stalls the echoed angle freezes while the servo keeps
-  // spinning. Trust the commanded angle so the display always tracks the servo.
-  state.lastRadarAngleSent = state.cmd.radarAngle ?? remoteState.telemetry.radarAngle ?? 0;
+  // The sweep source depends on mode: on REAL hardware the boat drives the servo
+  // autonomously and reports its actual angle in telemetry (authoritative); in
+  // MOCK the PC drives the sweep so the commanded angle is freshest.
+  state.lastRadarAngleSent = sweepAngle();
 
   if (syncCmd) {
     // תרחישי מוק יכולים להתחיל את הסירה בכל מקום (למשל פינה). מזריעים את מסגרת
@@ -529,14 +707,17 @@ function applyRemoteState(remoteState, syncCmd = false) {
     state.pose.y = state.telemetry.boatY ?? 0;
     state.pose.headingDeg = state.telemetry.boatHeadingDeg ?? 0;
     state.pose.speedCms = 0;
+    state.pose.turnRateRadS = 0;
     state.lastPoseT = 0;
   }
 
   if (state.mockEnabled || state.connected) {
     updateRadarMemory();
     accumulateRadarMap();
+    updateLiveScan();
   } else {
     radarMemory.clear();
+    liveScan.clear();
   }
 
   ensureWorldLoaded();
@@ -548,6 +729,11 @@ function applyRemoteState(remoteState, syncCmd = false) {
   mockSwitch.checked = state.mockEnabled;
   portSelect.disabled = state.mockEnabled || state.connected;
   refreshPortsBtn.disabled = state.mockEnabled || state.connected;
+
+  // Show the mock world picture and the accumulated map only in mock mode.
+  // (Use style.display, not [hidden]: .panel sets display:flex which would win.)
+  if (worldPanel) worldPanel.style.display = state.mockEnabled ? "" : "none";
+  if (mapPanel) mapPanel.style.display = state.mockEnabled ? "" : "none";
 
   if (state.lastError) {
     setServerMessage(state.lastError, true);
@@ -604,6 +790,32 @@ function onModeChange() {
   if (!state.manualMode) {
     state.cmd.leftSpeed = 0;
     state.cmd.rightSpeed = 0;
+    // Real-world autonomous restarts with a fresh online bow estimate + scan.
+    if (!state.mockEnabled) {
+      state.nav.bowOffsetDeg = BOW_SERVO_OFFSET_DEG;
+      state.nav.bowLocked = false;
+      state.nav.rwPhase = "calib";
+      state.nav.calibActive = true;
+      state.nav.calibStart = performance.now();
+      state.nav.spinUntil = 0;
+      state.nav.settleUntil = 0;
+      // Coarse travel direction: heading 0 = "the way the bow points now", which
+      // the operator aims at the goal/channel entrance before arming autonomy.
+      state.pose.x = 0;
+      state.pose.y = 0;
+      state.pose.headingDeg = 0;
+      state.pose.turnRateRadS = 0;
+      state.lastPoseT = 0;
+      liveScan.clear();
+      rawPrev.clear();
+      bowEstSin = 0;
+      bowEstCos = 0;
+    }
+    // Begin a fresh run recording (new log file) whenever autonomy arms.
+    startNavLogSession();
+  } else {
+    // Autonomy disarmed: push the tail of the run to disk.
+    flushNavLog();
   }
   updateCommandUI();
 }
@@ -664,8 +876,10 @@ function updateManualCommandFromJoystick() {
   const forward = -state.joystick.y;
   const turn = state.joystick.x;
 
-  state.cmd.leftSpeed = clamp(Math.round((forward + turn) * 255), -255, 255);
-  state.cmd.rightSpeed = clamp(Math.round((forward - turn) * 255), -255, 255);
+  // מגבילים את פלט הג'ויסטיק למדרגי המנוע (0 / 70 / 100, עם סימן), כך שהפקודה
+  // המוצגת והנשלחת תואמת בדיוק את מה שהמנוע יריץ בפועל.
+  state.cmd.leftSpeed = shapeMotorSpeed(Math.round((forward + turn) * 255));
+  state.cmd.rightSpeed = shapeMotorSpeed(Math.round((forward - turn) * 255));
   updateCommandUI();
 }
 
@@ -702,12 +916,11 @@ function setupWinchJoystick() {
     winchSpeedValue.textContent = String(state.cmd.winchSpeed);
   };
 
+  // בשחרור הידית נשארת במקומה והמהירות נשמרת (הכננת אינה חוזרת לאפס מעצמה),
+  // כך שאפשר "לנעול" משיכה/שחרור מתמשך בלי להחזיק את הסמן.
   const stop = () => {
     if (!active) return;
     active = false;
-    state.cmd.winchSpeed = 0;
-    winchJoystickHandle.style.transform = "translate(-50%, -50%)";
-    winchSpeedValue.textContent = "0";
   };
 
   winchJoystickBase.addEventListener("pointerdown", (e) => {
@@ -723,6 +936,7 @@ function setupWinchJoystick() {
   winchJoystickBase.addEventListener("pointercancel", stop);
 }
 
+
 // The 4 sensors sit 90° apart on ONE servo, so sweeping 15..90° already paints
 // the full 360° picture. The PC drives the servo so it climbs to 90°, then
 // walks gently back down one 15° step at a time to 0° (instead of slamming
@@ -734,14 +948,24 @@ function setupWinchJoystick() {
 function advanceRadarSweep() {
   const step = 15;
   let next = state.cmd.radarAngle + step * state.radarSweepDir;
-  if (next >= 90) {
-    next = 90;
+  if (next >= 75) {
+    next = 75;
     state.radarSweepDir = -1;
   } else if (next <= 0) {
     next = 0;
     state.radarSweepDir = 1;
   }
   state.cmd.radarAngle = next;
+}
+
+// Effective servo sweep angle used for all rendering/mapping. On REAL hardware
+// the boat now drives the radar sweep autonomously (firmware-local timer) and
+// echoes its actual angle in telemetry, so that echoed angle is the source of
+// truth. In MOCK the PC drives the sweep, so the commanded angle is freshest
+// (telemetry echoes it a frame later).
+function sweepAngle() {
+  if (state.mockEnabled) return state.cmd.radarAngle ?? state.telemetry.radarAngle ?? 0;
+  return state.telemetry.radarAngle ?? state.cmd.radarAngle ?? 0;
 }
 
 // Returns the nearest obstacle distance (cm) within toleranceDeg of a given
@@ -802,9 +1026,14 @@ function integratePose(cmd, dtSec) {
   // פתולוגית (לשונית ברקע דקות) כדי לא לשגר את הפוזה.
   let dt = clamp(dtSec, 0, 1.0);
   if (dt <= 0) return;
-  const throttle = (cmd.leftSpeed + cmd.rightSpeed) / (2 * 255);
-  const turn = (cmd.rightSpeed - cmd.leftSpeed) / (2 * 255);
-  const target = throttle * DR_MAX_SPEED_CMS;
+  // הסירה האמיתית מעצבת כל מנוע ל-{0} ∪ [40,100] לפני שהוא מגיע למנועים, ולכן
+  // האומדן חייב לעצב אף הוא — כך גם ידני וגם אוטונומי מוגבלים לאותה רצועת כוח.
+  const left = shapeMotorSpeed(cmd.leftSpeed);
+  const right = shapeMotorSpeed(cmd.rightSpeed);
+  const throttle = (left + right) / (2 * 255);
+  const turn = (right - left) / (2 * 255);
+  const thrust = throttle * DR_MAX_SPEED_CMS * DR_LINEAR_DRAG;
+  const targetTurnRate = turn * DR_TURN_RATE;
   const HX = world.boundsHalfX || 600;
   const HY = world.boundsHalfY || 450;
   // תת-צעד ב-50ms בדיוק כמו השרת, כך שאינטגרציית אוילר של הלקוח מתקדמת צעד-בצעד
@@ -812,8 +1041,12 @@ function integratePose(cmd, dtSec) {
   const SERVER_STEP_SEC = 0.05;
   while (dt > 1e-6) {
     const h = Math.min(SERVER_STEP_SEC, dt);
-    state.pose.speedCms += (target - state.pose.speedCms) * DR_ACCEL_GAIN * h / 0.05;
-    const hr = degToRad(state.pose.headingDeg) + turn * DR_TURN_RATE * h;
+    // תנע קווי: דחף מנוגד לגרר מים לינארי — הכלי מחליק אחרי ניתוק המצערת.
+    state.pose.speedCms += (thrust - DR_LINEAR_DRAG * state.pose.speedCms) * h;
+    // תנע זוויתי: קצב הסחרור מתקרב בהדרגה לקצב המבוקש (וממשיך רגע אחרי שינוי
+    // הפקודה) במקום להיצמד מיידית — כך סיבובים "מגלשים" כמו כלי אמיתי.
+    state.pose.turnRateRadS += (targetTurnRate - state.pose.turnRateRadS) * DR_TURN_DRAG * h;
+    const hr = degToRad(state.pose.headingDeg) + state.pose.turnRateRadS * h;
     state.pose.x = clamp(state.pose.x + Math.sin(hr) * state.pose.speedCms * h, -HX, HX);
     state.pose.y = clamp(state.pose.y + Math.cos(hr) * state.pose.speedCms * h, -HY, HY);
     state.pose.headingDeg = normalizeDeg((hr * 180) / Math.PI);
@@ -827,6 +1060,7 @@ function resetPose() {
   state.pose.y = 0;
   state.pose.headingDeg = 0;
   state.pose.speedCms = 0;
+  state.pose.turnRateRadS = 0;
   state.lastPoseT = 0;
 }
 
@@ -928,30 +1162,50 @@ function goalBearingRel() {
   return ((absBearing - heading + 540) % 360) - 180;
 }
 
+// אזימוט-כיוון-שיוט יחסי לחרטום: כמו goalBearingRel אך אל נקודת-כיוון שמצמצמת את
+// הרכיב הצדדי (x) של היעד כשהסירה עדיין רחוקה ממנו אנכית. כך הסירה מטפסת כמעט-
+// אנכית דרך הפערים במקום להימשך אל דופן-הצד של פינת-היעד, וממקדת אל היעד עצמו רק
+// כשהיא כבר סמוכה אליו אנכית.
+function aimBearingRel() {
+  const bx = state.pose.x;
+  const by = state.pose.y;
+  const heading = state.pose.headingDeg;
+  const g = state.nav.goal;
+  const dy = g.y - by;
+  const latK = clamp(GOAL_LATERAL_RANGE / Math.max(1, Math.abs(dy)), 0, 1);
+  // כשעדיין רחוקים מהיעד אנכית (latK→קטן) מכוונים אל ציר-הערוץ (x=0),
+  // שם כל הפערים חופפים — כך הסירה מטפסת במרכז הערוץ וחוצה את כל
+  // המחסומים; רק כשמתקרבים ליעד (latK→1) הכיוון נסוג אל x של היעד.
+  const aimX = CHANNEL_CENTER_X * (1 - latK) + g.x * latK;
+  const absBearing = (Math.atan2(aimX - bx, dy) * 180) / Math.PI;
+  return ((absBearing - heading + 540) % 360) - 180;
+}
+
 // \u05d2\u05dc\u05d0\u05d9-\u05ea\u05e7\u05d9\u05e2\u05d4: \u05e2\u05d5\u05e7\u05d1 \u05d0\u05d7\u05e8 \u05d4\u05ea\u05e7\u05d3\u05de\u05d5\u05ea \u05e0\u05d8\u05d5 \u05d0\u05dc \u05d4\u05d9\u05e2\u05d3 \u05d1\u05d7\u05dc\u05d5\u05df \u05d6\u05de\u05df \u05e0\u05e2. \u05d0\u05dd \u05d1\u05de\u05e6\u05d1 seek
 // \u05dc\u05d0 \u05d4\u05ea\u05e7\u05d3\u05de\u05e0\u05d5 \u2014 \u05e2\u05d5\u05d1\u05e8\u05d9\u05dd \u05dc\u05e2\u05e7\u05d9\u05d1\u05ea-\u05d3\u05d5\u05e4\u05df; \u05d0\u05dd \u05d1\u05de\u05e6\u05d1 follow \u05e2\u05e7\u05d9\u05d1\u05d4 \u05e9\u05dc\u05d0 \u05de\u05ea\u05e7\u05d3\u05de\u05ea \u2014
 // \u05de\u05d7\u05dc\u05d9\u05e4\u05d9\u05dd \u05d9\u05d3 \u05db\u05d3\u05d9 \u05dc\u05e9\u05d1\u05d5\u05e8 \u05e1\u05d9\u05de\u05d8\u05e8\u05d9\u05d4 \u05d5\u05dc\u05d4\u05d9\u05de\u05e0\u05e2 \u05de\u05dc\u05d5\u05dc\u05d0\u05d4 \u05d0\u05d9\u05df-\u05e1\u05d5\u05e4\u05d9\u05ea.
 function updateStuckDetector() {
   const now = performance.now();
-  const d = goalDistance();
+  const bx = state.pose.x;
+  const by = state.pose.y;
   const a = state.nav.progressAnchor;
   if (!a) {
-    state.nav.progressAnchor = { dist: d, t: now };
+    state.nav.progressAnchor = { x: bx, y: by, t: now };
     return;
   }
-  if (a.dist - d >= STUCK_PROGRESS_CM) {
-    state.nav.progressAnchor = { dist: d, t: now }; // \u05d4\u05ea\u05e7\u05d3\u05de\u05e0\u05d5 \u2014 \u05d0\u05e4\u05e1 \u05e2\u05d5\u05d2\u05df
+  // תזוזה מרחבית נטו מעבר לסף -> הסירה מגיעה למשהו (גם דרך עיקוף), לא מסתובבת
+  // במקום -> אפס עוגן.
+  if (Math.hypot(bx - a.x, by - a.y) >= STUCK_TRAVEL_CM) {
+    state.nav.progressAnchor = { x: bx, y: by, t: now };
     return;
   }
   if (now - a.t < STUCK_WINDOW_MS) return;
-  // \u05dc\u05d0 \u05d4\u05ea\u05e7\u05d3\u05de\u05e0\u05d5 \u05de\u05e1\u05e4\u05d9\u05e7 \u05d1\u05ea\u05d5\u05da \u05d4\u05d7\u05dc\u05d5\u05df.
-  if (state.nav.mode === "seek") {
-    enterWallFollow();
-  } else if (state.nav.mode === "follow") {
-    state.nav.followHand *= -1; // \u05e2\u05e7\u05d9\u05d1\u05d4 \u05ea\u05e7\u05d5\u05e2\u05d4 -> \u05d4\u05d7\u05dc\u05e3 \u05d9\u05d3
-    state.nav.wallSince = now;
-    state.nav.progressAnchor = { dist: d, t: now };
-  }
+  // חלון ארוך עם תזוזה מרחבית זעומה. הערה חשובה: במבוכי-מחיצות בבריכה
+  // עקיבת-דופן (follow) רק הזיקה — היא “נדדה” את הסירה אחורה והחוצה מהפער.
+  // שובר-התקיעה האמין כאן הוא תמרון-החילוץ (updateEscapeManeuver, נסיעה-לאחור)
+  // שכבר רץ קודם. לכן איננו עוברים מ-seek ל-follow — רק מאפסים עוגן ונותנים
+  // לשיוט/חילוץ להמשיך. (מצב follow נשמר בקוד אך אינו מופעל אוטומטית כאן.)
+  state.nav.progressAnchor = { x: bx, y: by, t: now };
 }
 
 // \u05db\u05e0\u05d9\u05e1\u05d4 \u05dc\u05de\u05e6\u05d1 \u05e2\u05e7\u05d9\u05d1\u05ea-\u05d3\u05d5\u05e4\u05df: \u05d1\u05d5\u05d7\u05e8\u05d9\u05dd \u05d0\u05ea \u05d4\u05e6\u05d3 \u05e9\u05d1\u05d5 \u05d4\u05de\u05db\u05e9\u05d5\u05dc \u05e7\u05e8\u05d5\u05d1 \u05d9\u05d5\u05ea\u05e8 \u05db"\u05d9\u05d3" \u05dc\u05e2\u05e7\u05d9\u05d1\u05d4.
@@ -962,7 +1216,7 @@ function enterWallFollow() {
   state.nav.mode = "follow";
   state.nav.wallSince = performance.now();
   state.avoidDir = 0;
-  state.nav.progressAnchor = { dist: goalDistance(), t: performance.now() };
+  state.nav.progressAnchor = { x: state.pose.x, y: state.pose.y, t: performance.now() };
 }
 
 // \u05e2\u05e7\u05d9\u05d1\u05ea \u05e7\u05d5-\u05de\u05ea\u05d0\u05e8 (Bug2). \u05de\u05d7\u05d6\u05d9\u05e8 true \u05db\u05dc \u05e2\u05d5\u05d3 \u05e0\u05e9\u05d0\u05e8\u05d9\u05dd \u05d1\u05e2\u05e7\u05d9\u05d1\u05d4 (\u05d5\u05db\u05d1\u05e8 \u05e0\u05e7\u05d1\u05e2\u05d5
@@ -983,7 +1237,7 @@ function followWall(distFront, goalRel) {
     distFront > CLEAR_DISTANCE_CM
   ) {
     state.nav.mode = "seek";
-    state.nav.progressAnchor = { dist: goalDistance(), t: performance.now() };
+    state.nav.progressAnchor = { x: state.pose.x, y: state.pose.y, t: performance.now() };
     return false;
   }
 
@@ -1051,7 +1305,326 @@ function updateEscapeManeuver() {
   return true;
 }
 
+// ===================================================================
+// Real-world reactive navigator (instantaneous radar, pose-free).
+// On the physical boat there is no odometry/compass, the radar sweep is slow
+// (~0.15-0.2 Hz) and noisy, and wind/waves make command-based dead reckoning
+// (state.pose) and the accumulated world map (mapCells/radarMemory anchored via
+// pose) unreliable. So the real-hardware autonomous path IGNORES pose AND the
+// accumulated map and steers purely from the FRESHEST radar returns, expressed
+// in BOW-relative bearings via a calibrated bow offset, with strong hysteresis
+// and gentle speeds. The pose/goal/map stack below is kept only for the mock
+// simulator (where pose tracks server truth).
+// ===================================================================
+
+// Bow direction expressed in the raw (sensor-mount + servo-angle) frame. The
+// servo zero is NOT the bow. This is only a STARTING GUESS; the real offset is
+// learned online, during motion, every trip (see the estimator in
+// updateLiveScan) and stored in state.nav.bowOffsetDeg.
+const BOW_SERVO_OFFSET_DEG = 60;
+const LIVE_SCAN_TTL_MS = 2200;   // a bearing bin is trusted only if refreshed this recently
+const LIVE_BIN_DEG = 15;         // bin width ~ sensor field of view
+const RW_CRUISE = 82;            // gentle forward (real momentum + noise tolerance)
+const RW_TURN = 85;              // pivot-in-place magnitude
+const RW_REVERSE = 80;           // backing-out magnitude when boxed in
+const RW_FRONT_CONE_DEG = 22;    // half-cone treated as "dead ahead"
+const RW_SIDE_BEARING_DEG = 55;  // bearing where we probe for the escape side
+const RW_SIDE_TOL_DEG = 40;
+const RW_BLOCK_CM = 45;          // front closer than this -> commit to a pivot
+const RW_CLEAR_CM = 85;          // front clear beyond this -> release the pivot (hysteresis)
+const RW_EMERGENCY_CM = 24;      // hard stop / pivot regardless of intent
+const RW_STEER_LIMIT = 26;       // max differential added to cruise while seeking
+const RW_ARC_DEG = 70;           // forward hemisphere scanned for a gap to steer into
+const RW_SIDE_TIE_CM = 15;       // |left-right| below this is a tie -> break toward goal
+// --- Wave/wind robustness (self-refining, no hardcoded environment size) ---
+const RW_MAX_RANGE = 300;        // "no echo" (open water) is stored as this range
+// Navigation reacts ONLY to obstacles inside this range. Anything farther is
+// noisy and irrelevant to a decision, so every clearance is capped here: all
+// bearings >= 1 m read as equally "open", and steering is driven purely by the
+// sub-metre returns. Differences BELOW the cap (i.e. real nearby obstacles) are
+// preserved, so "aim at the farthest direction" still works when boxed in.
+const RW_DECISION_RANGE_CM = 100;
+const RW_OPEN_FRAC = 0.55;       // open gap = clearance >= this fraction of the deepest in view
+const RW_OPEN_MIN_CM = 45;       // floor for the adaptive open threshold (small pools)
+const RW_SPIKE_RATE_CM_S = 130;  // implied closing speed above this = wave spike, never votes
+// --- Online bow calibration (runs during motion, recalibrates every trip) ---
+const CALIB_DURATION_MS = 3000;  // max length of the initial straight seed pulse
+const RW_FWD_EST_NET = 120;      // min |L|+|R| that counts as "driving forward"
+const RW_FWD_EST_DIFF = 40;      // max |L-R| that still counts as "roughly straight"
+const RW_CLOSE_RATE_MIN = 5;     // cm/s: min closing rate for a bearing to vote for the bow
+const RW_CLOSE_RATE_CAP = 60;    // cm/s: clamp a single vote's weight
+const BOW_EST_DECAY = 0.9;       // per-update memory of the circular accumulator
+const BOW_EST_MIN_CONF = 50;     // accumulator magnitude required before adopting the estimate
+
+// bowRel bin (integer, -180..180 step LIVE_BIN_DEG) -> { dist, t }
+const liveScan = new Map();
+// Online bow estimator state: last range per raw bin + a decaying circular
+// accumulator of "which raw bearing is closing fastest while moving forward".
+const rawPrev = new Map();
+let bowEstSin = 0;
+let bowEstCos = 0;
+
+function wrap180(deg) {
+  return (((deg % 360) + 540) % 360) - 180;
+}
+
+function binBearing(deg) {
+  return wrap180(Math.round(wrap180(deg) / LIVE_BIN_DEG) * LIVE_BIN_DEG);
+}
+
+// Fold the current telemetry frame into the pose-free live scan AND run the
+// online bow estimator. Called on every telemetry refresh. Uses the ECHOED
+// servo angle so a bearing is only stored where the sensor array actually
+// pointed.
+function updateLiveScan() {
+  const servo = state.telemetry.radarAngle ?? state.cmd.radarAngle ?? 0;
+  const now = performance.now();
+  const bowOff = state.nav.bowOffsetDeg ?? BOW_SERVO_OFFSET_DEG;
+  // Only a roughly-straight forward run makes the bow the fastest-closing
+  // bearing, so gate the estimator on it.
+  const L = state.cmd.leftSpeed;
+  const R = state.cmd.rightSpeed;
+  const forwardMotion =
+    L > 0 && R > 0 && L + R >= RW_FWD_EST_NET && Math.abs(L - R) <= RW_FWD_EST_DIFF;
+  for (const beam of SENSOR_BEAMS) {
+    const raw = state.telemetry[beam.key];
+    if (raw == null || raw < 0) continue; // no data / invalid this beam
+    // "No echo" (0/999) is real information: open water at max range. Storing it
+    // (instead of skipping) lets freshness detection work AND lets a momentary
+    // wave DROPOUT be seen as "open at max" rather than an unknown/stale gap.
+    const measured = raw === 0 || raw >= 999 ? RW_MAX_RANGE : raw;
+    const rawBearing = normalizeDeg(beam.dir + servo); // sensor-mount + servo (raw frame)
+    const bowRel = binBearing(rawBearing - bowOff);    // 0 = bow (current estimate)
+    liveScan.set(bowRel, { dist: measured, t: now });
+
+    // --- Online bow calibration: the raw bearing whose range CLOSES fastest
+    // while driving forward IS the bow. Votes feed a decaying circular
+    // accumulator, so the offset self-calibrates and re-learns every trip with
+    // no hardcoded servo/bow value. Works in the RAW frame, independent of the
+    // current estimate, so it never feeds back on itself.
+    const key = binBearing(rawBearing);
+    const prev = rawPrev.get(key);
+    rawPrev.set(key, { dist: measured, t: now });
+    if (forwardMotion && prev) {
+      const dt = (now - prev.t) / 1000;
+      if (dt >= 0.1 && dt <= 4) {
+        const rate = (measured - prev.dist) / dt; // cm/s; negative = closing
+        // Vote only for a plausible closing; reject wave spikes whose implied
+        // speed no real boat could make.
+        if (rate < -RW_CLOSE_RATE_MIN && rate > -RW_SPIKE_RATE_CM_S) {
+          const w = Math.min(-rate, RW_CLOSE_RATE_CAP);
+          const rad = degToRad(rawBearing);
+          bowEstSin = BOW_EST_DECAY * bowEstSin + w * Math.sin(rad);
+          bowEstCos = BOW_EST_DECAY * bowEstCos + w * Math.cos(rad);
+        }
+      }
+    }
+  }
+  // Adopt the running estimate once it is confident enough.
+  if (Math.hypot(bowEstSin, bowEstCos) >= BOW_EST_MIN_CONF) {
+    state.nav.bowOffsetDeg = normalizeDeg(
+      (Math.atan2(bowEstSin, bowEstCos) * 180) / Math.PI
+    );
+    state.nav.bowLocked = true;
+  }
+}
+
+// Fresh returns within +/-tolDeg of a bow-relative bearing, summarised. The
+// MEDIAN rejects isolated wave/spray spikes (a lone near- or far-blip is
+// outvoted by its neighbours) without adding any temporal latency at the slow
+// link cadence; min is kept for the hard emergency stop; count distinguishes
+// "open water" (fresh, large) from "no data yet / dropout" (count 0).
+function liveCone(bearingRel, tolDeg) {
+  const now = performance.now();
+  const vals = [];
+  for (const [bin, e] of liveScan) {
+    if (now - e.t > LIVE_SCAN_TTL_MS) continue;
+    // Cap every clearance at the 1 m decision range: obstacles farther than this
+    // are irrelevant noise and must not sway steering (they all read "open").
+    if (Math.abs(wrap180(bin - bearingRel)) <= tolDeg)
+      vals.push(Math.min(e.dist, RW_DECISION_RANGE_CM));
+  }
+  if (vals.length === 0) return { min: 999, median: 999, count: 0 };
+  vals.sort((a, b) => a - b);
+  return { min: vals[0], median: vals[Math.floor(vals.length / 2)], count: vals.length };
+}
+
+// Spike-robust distance (median of the fresh cone). 999 = open / no data.
+function liveDistance(bearingRel, tolDeg) {
+  return liveCone(bearingRel, tolDeg).median;
+}
+
+// Deepest (farthest) fresh clearance over a bearing range, full-circle capable.
+// Used to pick an escape heading when boxed in: we always move toward the most
+// open water, even if that water is behind us.
+function bestOpenBearing(loB, hiB) {
+  let best = -1;
+  let bestB = 0;
+  let count = 0;
+  for (let b = loB; b <= hiB; b += LIVE_BIN_DEG) {
+    const c = liveCone(b, LIVE_BIN_DEG * 0.8);
+    if (c.count === 0) continue; // no fresh data at this bearing
+    count += c.count;
+    if (c.median > best) {
+      best = c.median;
+      bestB = b;
+    }
+  }
+  return { bearing: bestB, clear: best, count };
+}
+
+// --- Left-wall following (35 cm) — the guiding autonomous logic ---
+const RW_WALL_TARGET_CM = 35;     // מרחק המטרה מהדופן השמאלית
+const RW_WALL_BAND_CM = 10;       // רוחב היסטרזיס סביב המטרה (± ס"מ)
+const RW_WALL_BEARING_DEG = -90;  // הדופן השמאלית במסגרת-חרטום (שלילי = שמאל)
+const RW_WALL_TOL_DEG = 30;       // סובלנות זוויתית לחרוט הצד השמאלי
+// כל סיבוב הוא סיבוב-במקום בציר 0 (מנועים ±80 מנוגדים), בפולסים קצרים ולא תנועה
+// אחת ארוכה: פולס סיבוב קצר, ואז חלון "יישוב" קצר (נסיעה ישרה או עצירה) שנותן
+// לסריקת המכ"ם להתרענן לפני החלטה נוספת — כך הסירה לא מסתחררת יתר על המידה ולא
+// נסחפת מהכיוון הרצוי.
+const RW_SPIN_PULSE_MS = 350;     // משך פולס-סיבוב יחיד
+const RW_SPIN_SETTLE_MS = 500;    // חלון היישוב בין פולסים
+
+// מבצע פנייה כרצף פולסי סיבוב-במקום קצרים סביב ציר 0 (±MOTOR_SPEED על מנועים
+// מנוגדים), מופרדים בחלון יישוב. dir>0 = סיבוב ימינה, dir<0 = סיבוב שמאלה.
+// settleStraight=true נוסע ישר קדימה בין פולסים (בטוח כשהחזית פתוחה — תיקוני
+// עקיבת-דופן); false עוצר במקום (כשהחזית חסומה).
+function pulseTurn(dir, settleStraight) {
+  const now = performance.now();
+  const p = state.nav;
+  if (now >= p.spinUntil && now >= p.settleUntil) {
+    // התחלת מחזור פולס חדש
+    p.spinUntil = now + RW_SPIN_PULSE_MS;
+    p.settleUntil = p.spinUntil + RW_SPIN_SETTLE_MS;
+  }
+  if (now < p.spinUntil) {
+    state.cmd.leftSpeed = -dir * MOTOR_SPEED; // סיבוב במקום (ציר 0)
+    state.cmd.rightSpeed = dir * MOTOR_SPEED;
+  } else if (settleStraight) {
+    state.cmd.leftSpeed = MOTOR_SPEED;
+    state.cmd.rightSpeed = MOTOR_SPEED;
+  } else {
+    state.cmd.leftSpeed = 0;
+    state.cmd.rightSpeed = 0;
+  }
+}
+
+// Real-world autonomous tick. GUIDING LOGIC: keep 35 cm from the LEFT wall
+// (bang-bang, 3-state motors 80/-80/0). The boat+radar rotate along the course
+// so the wall curves and can appear ahead or astern: a wall straight ahead is
+// an INSIDE corner (turn right, away from the left wall); a receding left wall
+// is an OUTSIDE corner (turn left to re-acquire it). Front-block + boxed-in
+// checks keep the boat from getting stuck against a wall. ALL turns are short
+// in-place spin pulses (axis 0) rather than long arcs, to avoid over-rotation
+// and heading drift.
+function updateAutonomousRealworld() {
+  const now = performance.now();
+
+  // --- Seed phase: gentle straight pulse until the bow is learned online ---
+  // (all bearings are bow-relative via the online-calibrated bow offset).
+  if (state.nav.rwPhase === "calib") {
+    const frontNow = liveDistance(0, RW_FRONT_CONE_DEG);
+    const done = now - (state.nav.calibStart || now) >= CALIB_DURATION_MS;
+    if (frontNow < RW_BLOCK_CM || done || state.nav.bowLocked) {
+      state.nav.rwPhase = "run";
+      liveScan.clear(); // reindex fresh returns under the learned offset
+    } else {
+      state.cmd.leftSpeed = MOTOR_SPEED; // straight, gentle
+      state.cmd.rightSpeed = MOTOR_SPEED;
+      return;
+    }
+  }
+
+  const fc = liveCone(0, RW_FRONT_CONE_DEG);
+  const front = fc.median;
+
+  // Committed-pivot hysteresis: once turning to clear the bow, keep pulsing the
+  // in-place spin until the front is genuinely clear (fresh AND beyond
+  // RW_CLEAR_CM) so a stale/dropout reading can't fake a "clear" too early. The
+  // settle window holds still (bow blocked) so it never creeps into the wall.
+  if (state.avoidDir !== 0) {
+    if (fc.count > 0 && front >= RW_CLEAR_CM) {
+      state.avoidDir = 0;
+    } else {
+      pulseTurn(state.avoidDir, false);
+      return;
+    }
+  }
+
+  // --- Anti-stuck: something blocking the bow (inside corner or a trap). ---
+  if (fc.count > 0 && front < RW_BLOCK_CM) {
+    const leftQ = liveDistance(-RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
+    const rightQ = liveDistance(RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
+    if (leftQ < RW_BLOCK_CM && rightQ < RW_BLOCK_CM) {
+      // Walled on the bow AND both quarters -> back straight out to break free.
+      state.avoidDir = 0;
+      state.cmd.leftSpeed = -MOTOR_SPEED;
+      state.cmd.rightSpeed = -MOTOR_SPEED;
+      return;
+    }
+    // Inside corner: wall ahead while following the left wall -> spin RIGHT in
+    // place (away from the left wall), committed via avoidDir until it clears.
+    state.avoidDir = 1; // +1 = spin right
+    pulseTurn(1, false);
+    return;
+  }
+
+  // --- Keep 35 cm from the left wall (bang-bang with a hysteresis band). ---
+  // Turns are short in-place spin pulses about axis 0; between pulses the boat
+  // drives straight (bow is open here) so it still makes forward progress.
+  const wc = liveCone(RW_WALL_BEARING_DEG, RW_WALL_TOL_DEG);
+  if (wc.count === 0) {
+    // No fresh left reading yet -> drive straight, let the servo sweep refresh
+    // that bearing rather than steer blind.
+    state.cmd.leftSpeed = MOTOR_SPEED;
+    state.cmd.rightSpeed = MOTOR_SPEED;
+    return;
+  }
+  const wall = wc.median;
+
+  if (wall > RW_WALL_TARGET_CM + RW_WALL_BAND_CM) {
+    // Wall too far / lost (outside corner, course turns left) -> spin LEFT.
+    pulseTurn(-1, true);
+  } else if (wall < RW_WALL_TARGET_CM - RW_WALL_BAND_CM) {
+    // Too close -> spin RIGHT to open the gap back to 35 cm.
+    pulseTurn(1, true);
+  } else {
+    // Within the 35 cm band -> straight ahead (also feeds the bow estimator).
+    state.cmd.leftSpeed = MOTOR_SPEED;
+    state.cmd.rightSpeed = MOTOR_SPEED;
+  }
+}
+
+// Instantaneous-radar safety envelope for the physical boat (no pose, no map).
+function realworldSafeCommand(cmd) {
+  const fc = liveCone(0, RW_FRONT_CONE_DEG);
+  const netForward = cmd.leftSpeed + cmd.rightSpeed;
+  // Use the fresh-cone MIN here (not the median): the hard stop must react even
+  // to a single genuinely-close return, at the cost of an occasional spray stop.
+  if (fc.count > 0 && fc.min < RW_EMERGENCY_CM && netForward > 0) {
+    // Something is right on the bow and we are still driving into it: cut the
+    // forward drive and pivot in place toward the more open side. Keep the
+    // navigator committed to the same pivot via state.avoidDir.
+    const left = liveDistance(-RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
+    const right = liveDistance(RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
+    const dir = right >= left ? 1 : -1;
+    state.avoidDir = dir;
+    cmd.leftSpeed = -dir * RW_TURN;
+    cmd.rightSpeed = dir * RW_TURN;
+  }
+  cmd.leftSpeed = shapeMotorSpeed(cmd.leftSpeed);
+  cmd.rightSpeed = shapeMotorSpeed(cmd.rightSpeed);
+  return cmd;
+}
+
 function updateAutonomousCommand() {
+  // Physical hardware: use the pose-free instantaneous-radar reactive navigator.
+  // The accumulated-map / goal-seeking stack below runs only in the simulator.
+  if (!state.mockEnabled) {
+    updateAutonomousRealworld();
+    return;
+  }
+
   if (!state.nav.goal) initNavGoal();
   // הגענו לקצה השני של הבריכה -> עצירה מלאה.
   if (goalDistance() <= GOAL_ARRIVE_CM) {
@@ -1073,6 +1646,8 @@ function updateAutonomousCommand() {
   const distLeft = getMemoryDistance(270, 45);
   const distRight = getMemoryDistance(90, 45);
   const goalRel = goalBearingRel();
+  // כיוון-שיוט עם משיכה-צדדית ממותנת-מרחק (טיפוס אנכי דרך הפערים; ראה aimBearingRel).
+  const aimRel = aimBearingRel();
 
   // גלאי-תקיעה: מנטר התקדמות נטו אל היעד; עשוי להעביר ל"follow" (עקיבת-דופן).
   updateStuckDetector();
@@ -1096,7 +1671,17 @@ function updateAutonomousCommand() {
   }
 
   if (distFront < SAFE_DISTANCE_CM) {
-    state.avoidDir = distLeft > distRight ? -1 : 1;
+    // בחירת צד עקיפה מוטת-יעד: במבוך סרפנטינה הפער של המכשול הבא נמצא לרוב בצד
+    // ה"סגור" יותר (קרוב ליעד) בעוד המים הפתוחים הם בצד ההפוך. עקיפה עיוורת אל
+    // הצד הפתוח שולחת את הסירה הרחק מהפער וגורמת ללולאות. לכן: אם צד-היעד פנוי
+    // מספיק — מתחייבים אליו (זוחלים אל הפער); רק אם הוא צר באמת בורחים לצד הפתוח.
+    const goalSide = aimRel < 0 ? -1 : 1; // -1 שמאל, +1 ימין (יחסית לחרטום)
+    const goalSideDist = goalSide < 0 ? distLeft : distRight;
+    if (goalSideDist > SAFE_DISTANCE_CM * 1.3) {
+      state.avoidDir = goalSide;
+    } else {
+      state.avoidDir = distLeft > distRight ? -1 : 1;
+    }
     applyAvoidTurn(state.avoidDir);
     return;
   }
@@ -1104,7 +1689,7 @@ function updateAutonomousCommand() {
   // שיוט: בוחר את הכיוון הפתוח ביותר בקשת החזית, מוטה אל אזימוט היעד. כך הסירה
   // נמשכת אל הקצה השני תוך התחמקות מגופים, במקום לשוטט למים פתוחים סתם.
   const targetBearing = chooseOpenHeading(
-    clamp(goalRel, -OPEN_SCAN_DEG, OPEN_SCAN_DEG),
+    clamp(aimRel, -OPEN_SCAN_DEG, OPEN_SCAN_DEG),
     GOAL_ATTRACT_PENALTY
   );
   const steer = clamp(targetBearing * OPEN_STEER_GAIN, -STEER_MAX, STEER_MAX);
@@ -1142,6 +1727,20 @@ function computeSafeCommand() {
     winchSpeed: state.cmd.winchSpeed,
     radarAngle: state.cmd.radarAngle,
   };
+
+  // בשליטה ידנית — מנטרלים (בינתיים) את הגבלת הקרבה: הפקודה נשלחת כמות שהיא
+  // ללא דריסת בטיחות. מושל המהירות/ההתחמקות פעילים רק בניווט האוטונומי.
+  if (state.manualMode) {
+    cmd.leftSpeed = shapeMotorSpeed(cmd.leftSpeed);
+    cmd.rightSpeed = shapeMotorSpeed(cmd.rightSpeed);
+    return cmd;
+  }
+
+  // Physical hardware: safety comes from the instantaneous radar, not from the
+  // pose-projected accumulated map (which drifts with dead reckoning).
+  if (!state.mockEnabled) {
+    return realworldSafeCommand(cmd);
+  }
 
   const bx = state.pose.x;
   const by = state.pose.y;
@@ -1289,6 +1888,11 @@ function computeSafeCommand() {
     }
   }
 
+  // קוונטיזציה סופית של פקודת המנוע האוטונומית למדרגי הכוח (0 / 70 / 100, עם
+  // סימן) — בדיוק כמו בשליטה הידנית ובשרת, כך שהמנוע רץ באותם מדרגים בכל מצב.
+  cmd.leftSpeed = shapeMotorSpeed(cmd.leftSpeed);
+  cmd.rightSpeed = shapeMotorSpeed(cmd.rightSpeed);
+
   return cmd;
 }
 
@@ -1320,7 +1924,7 @@ function drawRadar() {
     radarCtx.stroke();
   }
 
-  drawBoat(cx, cy);
+  drawBoat(cx, cy, maxR / sim.maxRange);
   drawSensorArcs(cx, cy, maxR);
   drawSensorBeams(cx, cy, maxR);
   drawRangeLabels(cx, cy, maxR);
@@ -1412,6 +2016,24 @@ function drawWorld() {
 
   // Obstacle bodies; highlight the ones the sensors could actually reach.
   let inRange = 0;
+  // Thin straight-line walls (baffles). Drawn as thick segments at their true
+  // 5 cm width so the ground-truth view matches the "obstacles are lines" model.
+  for (const wall of world.walls) {
+    const a = toScreen(wall.x1, wall.y1);
+    const b = toScreen(wall.x2, wall.y2);
+    // In range if any point on the segment is within sensor reach of the boat.
+    const midDist = Math.hypot((wall.x1 + wall.x2) / 2 - bx, (wall.y1 + wall.y2) / 2 - by);
+    const within = midDist - Math.hypot(wall.x2 - wall.x1, wall.y2 - wall.y1) / 2 <= world.maxRange;
+    if (within) inRange += 1;
+    worldCtx.beginPath();
+    worldCtx.moveTo(a.x, a.y);
+    worldCtx.lineTo(b.x, b.y);
+    worldCtx.lineCap = "round";
+    worldCtx.lineWidth = Math.max(2, (wall.thickness ?? 5) * scale);
+    worldCtx.strokeStyle = within ? "rgba(44, 255, 197, 0.85)" : "rgba(120, 140, 150, 0.5)";
+    worldCtx.stroke();
+  }
+  worldCtx.lineCap = "butt";
   for (const t of world.targets) {
     const p = toScreen(t.x, t.y);
     const dist = Math.hypot(t.x - bx, t.y - by);
@@ -1446,9 +2068,9 @@ function drawWorld() {
   }
 
   // Sensor beam directions in the world frame (heading + servo sweep + offset).
-  // Use the commanded sweep (what the PC drives the servo to) so the beams turn
-  // in lockstep with the physical servo even if telemetry echo stalls.
-  const sweep = state.cmd.radarAngle ?? 0;
+  // Use the effective sweep angle (boat-driven telemetry on real hardware,
+  // commanded on mock) so the beams track the physical servo.
+  const sweep = sweepAngle();
   worldCtx.strokeStyle = "rgba(255, 241, 118, 0.35)";
   worldCtx.lineWidth = 1;
   for (const beam of SENSOR_BEAMS) {
@@ -1460,15 +2082,16 @@ function drawWorld() {
   }
 
   // Boat, rotated to its real heading (0 = north / up, clockwise positive).
+  // Drawn to true scale: a 30 cm × 30 cm hull (±15 cm from its centre).
   worldCtx.save();
   worldCtx.translate(boat.x, boat.y);
   worldCtx.rotate(degToRad(heading));
   worldCtx.fillStyle = "rgba(255, 241, 118, 0.95)";
   worldCtx.beginPath();
-  worldCtx.moveTo(0, -12);
-  worldCtx.lineTo(8, 9);
-  worldCtx.lineTo(0, 5);
-  worldCtx.lineTo(-8, 9);
+  worldCtx.moveTo(0, -15 * scale);
+  worldCtx.lineTo(15 * scale, 15 * scale);
+  worldCtx.lineTo(0, 6 * scale);
+  worldCtx.lineTo(-15 * scale, 15 * scale);
   worldCtx.closePath();
   worldCtx.fill();
   worldCtx.restore();
@@ -1484,7 +2107,7 @@ function drawWorld() {
 // measured range). Also clears the empty cone in front of the arc and records
 // the boat's path (trail). Cells only become "real" where arcs intersect.
 function accumulateRadarMap() {
-  const sweep = state.cmd.radarAngle ?? 0;
+  const sweep = sweepAngle();
   const heading = state.pose.headingDeg;
   const bx = state.pose.x;
   const by = state.pose.y;
@@ -1738,16 +2361,17 @@ function drawMap() {
   }
 
   // Boat at its live pose, rotated to heading (0 = north / up).
+  // Drawn to true scale: a 30 cm × 30 cm hull (±15 cm from its centre).
   const boat = toScreen(bx, by);
   mapCtx.save();
   mapCtx.translate(boat.x, boat.y);
   mapCtx.rotate(degToRad(state.pose.headingDeg));
   mapCtx.fillStyle = "rgba(255, 241, 118, 0.95)";
   mapCtx.beginPath();
-  mapCtx.moveTo(0, -12);
-  mapCtx.lineTo(8, 9);
-  mapCtx.lineTo(0, 5);
-  mapCtx.lineTo(-8, 9);
+  mapCtx.moveTo(0, -15 * scale);
+  mapCtx.lineTo(15 * scale, 15 * scale);
+  mapCtx.lineTo(0, 6 * scale);
+  mapCtx.lineTo(-15 * scale, 15 * scale);
   mapCtx.closePath();
   mapCtx.fill();
   mapCtx.restore();
@@ -1773,16 +2397,18 @@ function drawMap() {
   requestAnimationFrame(drawMap);
 }
 
-function drawBoat(cx, cy) {
+function drawBoat(cx, cy, pxPerCm) {
+  // Drawn to true scale: a 30 cm × 30 cm hull (±15 cm from its centre).
+  const s = pxPerCm;
   radarCtx.save();
   radarCtx.translate(cx, cy);
   // Boat always points up - no rotation
   radarCtx.fillStyle = "rgba(255, 241, 118, 0.95)";
   radarCtx.beginPath();
-  radarCtx.moveTo(0, -13);
-  radarCtx.lineTo(9, 10);
-  radarCtx.lineTo(0, 6);
-  radarCtx.lineTo(-9, 10);
+  radarCtx.moveTo(0, -15 * s);
+  radarCtx.lineTo(15 * s, 15 * s);
+  radarCtx.lineTo(0, 6 * s);
+  radarCtx.lineTo(-15 * s, 15 * s);
   radarCtx.closePath();
   radarCtx.fill();
   radarCtx.restore();
@@ -1809,7 +2435,7 @@ function updateRadarMemory() {
   // boat's heading. Store each reading at its ABSOLUTE world bearing so that a
   // rotating boat leaves the world fixed in place (the radar view then rotates
   // the world back around the boat at draw time, keeping the bow pointing up).
-  const sweep = state.cmd.radarAngle ?? 0;
+  const sweep = sweepAngle();
   const heading = state.pose.headingDeg;
   const bx = state.pose.x;
   const by = state.pose.y;
@@ -1880,30 +2506,47 @@ function drawSensorArcs(cx, cy, maxR) {
     });
   }
 
+  // Noise rejection: a genuine surface reflects several returns clustered at a
+  // similar bearing AND a similar range, whereas sensor noise shows up as a lone
+  // blip with nothing beside it (e.g. one 25 cm return next to three 50 cm
+  // returns is spray/echo, not an object). Keep a point only if it has at least
+  // one neighbour within NOISE_ANGLE_DEG and NOISE_DIST_CM; drop the isolated
+  // ones so they never appear on the picture.
+  const NOISE_ANGLE_DEG = 30; // ~two 15° sweep slots
+  const NOISE_DIST_CM = 20;   // similar range (< the 25 cm gap in the example)
+  const signal = points.filter((p) =>
+    points.some(
+      (q) =>
+        q !== p &&
+        absAngleDiffDeg(p.slot, q.slot) <= NOISE_ANGLE_DEG &&
+        Math.abs(p.dist - q.dist) <= NOISE_DIST_CM
+    )
+  );
+
   // Connect neighbours that belong to the same continuous surface (a wall):
   // adjacent bearing slots (<= ~20° apart) whose ranges are close. Grazing-angle
   // steps along a flat wall grow with 1/cos, so the range gap between two 15°
   // slots can reach ~55 cm near the wall edges; 70 cm covers that while still
   // leaving well-separated bodies as isolated dots.
-  points.sort((a, b) => a.slot - b.slot);
+  signal.sort((a, b) => a.slot - b.slot);
   radarCtx.strokeStyle = "rgba(44, 255, 197, 0.55)";
   radarCtx.lineWidth = 2;
-  for (let i = 0; i < points.length; i += 1) {
-    const a = points[i];
-    const b = points[(i + 1) % points.length];
-    if (points.length < 2) break;
+  for (let i = 0; i < signal.length; i += 1) {
+    const a = signal[i];
+    const b = signal[(i + 1) % signal.length];
+    if (signal.length < 2) break;
     if (absAngleDiffDeg(a.slot, b.slot) <= 20 && Math.abs(a.dist - b.dist) <= 45) {
       radarCtx.beginPath();
       radarCtx.moveTo(a.x, a.y);
       radarCtx.lineTo(b.x, b.y);
       radarCtx.stroke();
     }
-    if (points.length === 2) break; // avoid drawing the same pair twice
+    if (signal.length === 2) break; // avoid drawing the same pair twice
   }
 
   // Draw each detection as a small blip on top of the connecting lines.
   radarCtx.fillStyle = "rgba(44, 255, 197, 0.95)";
-  for (const p of points) {
+  for (const p of signal) {
     radarCtx.beginPath();
     radarCtx.arc(p.x, p.y, 2.5, 0, Math.PI * 2);
     radarCtx.fill();
@@ -1912,7 +2555,7 @@ function drawSensorArcs(cx, cy, maxR) {
 
 function drawSensorBeams(cx, cy, maxR) {
   const fovHalf = 7.5;
-  const sweep = state.cmd.radarAngle ?? 0;
+  const sweep = sweepAngle();
   radarCtx.save();
   radarCtx.lineWidth = 1.5;
   for (const beam of SENSOR_BEAMS) {

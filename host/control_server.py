@@ -20,15 +20,146 @@ from serial.tools import list_ports
 
 ROOT_DIR = Path(__file__).resolve().parent
 WEB_DIR = ROOT_DIR / "web"
+LOG_DIR = ROOT_DIR / "logs"
+
+# --- Autonomous-run data collection ----------------------------------------
+# The browser navigator POSTs batches of decision records (telemetry it RECEIVES
+# + commands it SENDS + what it perceived) to /api/navlog. We append them as
+# newline-delimited JSON to a per-run file so a run can be replayed/analysed
+# afterwards even if the browser (phone) is closed mid-experiment.
+_navlog_lock = threading.Lock()
+_navlog_file: Path | None = None
+
+
+def navlog_append(records: list, reset: bool = False) -> str:
+    """Append decision records to the current run's NDJSON log (thread-safe).
+
+    `reset` starts a fresh file (call it once when a new autonomous run arms).
+    """
+    global _navlog_file
+    with _navlog_lock:
+        if reset or _navlog_file is None:
+            LOG_DIR.mkdir(exist_ok=True)
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            _navlog_file = LOG_DIR / f"nav-{ts}.ndjson"
+        with _navlog_file.open("a", encoding="utf-8") as fh:
+            for rec in records:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return _navlog_file.name
 
 # How often the server re-sends the last command over serial while connected.
 # Must be shorter than the Arduino's FAILSAFE_TIMEOUT_MS (800ms) so that a
 # stationary boat under active control is never mistaken for a lost link.
 HEARTBEAT_INTERVAL_S = 0.25
 
+# --- Real-world link resilience --------------------------------------------
+# Telemetry is considered STALE if no fresh frame arrived within this window.
+# The reader updates lastMessageAt on every received line, so a healthy link
+# (even at ~1 Hz) stays well under this. Exposed to the UI via BridgeState.stale.
+TELEMETRY_STALE_S = 3.0
+# Minimum spacing between PHYSICAL serial writes. A burst of UI commands can
+# otherwise saturate the half-duplex RF link and starve the boat's return
+# telemetry (observed: the stream freezes under command flooding). A skipped
+# command still becomes state.command and is pushed out by the heartbeat, so
+# nothing is lost.
+SERIAL_MIN_WRITE_INTERVAL_S = 0.1
+# When the link goes stale the watchdog reopens the port ONCE per cooldown
+# (reopening toggles DTR and resets the radio bridge, reviving the stream).
+# The cooldown must exceed connect()'s 2 s settle so we never thrash the boot
+# (observed: fast repeated reconnects never let the boat finish booting).
+RECONNECT_COOLDOWN_S = 6.0
+# Median-filter window per sensor channel to reject single-frame spikes (real
+# ultrasonic readings jitter and occasionally return phantom short/long values).
+SENSOR_MEDIAN_WINDOW = 3
+# While the boat is stopped its radar servo would sit still and stop pinging,
+# so telemetry only flows during motion. When idle we advance radarAngle through
+# these steps on each heartbeat to keep the servo scanning and pings arriving.
+IDLE_SWEEP_ANGLES = (0, 30, 60, 90, 120, 150, 180)
+
 
 def clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
+
+
+# Drive-motor speed by ABSOLUTE value, applied to BOTH manual and autonomous
+# commands right before they reach the motor (build_serial_line + the mock loop):
+#   |v| < 35          -> 0   (dead zone: too weak to bother -> motor off)
+#   otherwise         -> clamped into the usable [70, 100] band (continuous)
+# The user's control scale is this 70..100 band; the sign (direction) is preserved.
+MOTOR_DEADZONE = 35        # below this magnitude -> 0 (off)
+MOTOR_LOW_SPEED = 70       # bottom of the usable band
+MOTOR_HIGH_SPEED = 100     # top of the usable band
+
+# Ultrasonic readings closer than this are treated as spurious (echo ring-down,
+# hull reflections, sensor cross-talk) and are discarded — mapped to the
+# out-of-range sentinel so nav and the radar display ignore them.
+MIN_VALID_DISTANCE_CM = 10
+OUT_OF_RANGE_CM = 999
+
+# --- Mock-hull dynamics (a real boat is NOT a kinematic point) ---------------
+# The vessel carries momentum: thrust from the motors fights water drag, so it
+# keeps gliding after the throttle is cut and needs time to spin up/down. These
+# constants are shared verbatim with the client odometry (integratePose in
+# app.js) so the dead-reckoned pose stays glued to the simulated ground truth.
+MOCK_MAX_SPEED_CMS = 45.0          # steady-state hull speed at full throttle
+MOCK_TURN_RATE = math.pi * 0.25    # steady-state yaw rate at full differential
+MOCK_LINEAR_DRAG = 1.4             # 1/s linear drag -> ~0.7 s coast time-const
+MOCK_TURN_DRAG = 2.5               # 1/s yaw drag    -> ~0.4 s spin time-const
+
+# --- Mock ultrasonic noise (real hardware is not perfect) --------------------
+# Every so often a ping returns nonsense: no echo at all (dropout) or a phantom
+# short reading (cross-talk / a wave). Every good ping still jitters a few cm.
+MOCK_SENSOR_DROPOUT_P = 0.03       # P(reading -> no echo / 999)
+MOCK_SENSOR_SPIKE_P = 0.03         # P(reading -> phantom short spike)
+MOCK_SENSOR_JITTER_CM = 2.0        # 1-sigma gaussian jitter on good pings
+
+# Baffle / boundary obstacles are thin STRAIGHT walls, not blobs. A physical
+# baffle is a few centimetres thick; model it as a 5 cm band.
+MOCK_WALL_THICKNESS_CM = 5.0
+
+
+def filter_near_reading(value: int) -> int:
+    """Drop sensor points closer than MIN_VALID_DISTANCE_CM (return sentinel)."""
+    return value if value >= MIN_VALID_DISTANCE_CM else OUT_OF_RANGE_CM
+
+
+def shape_motor_speed(value: int) -> int:
+    """Shape a drive-motor speed to {0} ∪ ±[70, 100], preserving direction.
+
+    - A magnitude below MOTOR_DEADZONE (35) becomes 0 (motor off).
+    - Any larger magnitude is clamped into the usable [70, 100] band, so the
+      operator gets continuous control across that range.
+    """
+    magnitude = abs(value)
+    if magnitude < MOTOR_DEADZONE:
+        return 0
+    stepped = min(max(magnitude, MOTOR_LOW_SPEED), MOTOR_HIGH_SPEED)
+    return stepped if value > 0 else -stepped
+
+
+def build_serial_line(command: "CommandState") -> str:
+    """Build the outgoing serial packet, applying hardware wiring corrections.
+
+    These fixes live here (host side) so the boat firmware never needs
+    re-flashing:
+    - The two drive motor channels are SWAPPED before sending: the logical left
+      speed is emitted on the right channel and vice versa, to match the boat's
+      physical wiring (left/right were reversed on the hardware).
+    - The net winch motor is wired with reversed polarity, so its speed is
+      inverted.
+    The drive motor speeds are also shaped via shape_motor_speed() so each
+    wheel is either off (0) or within the usable [70, 100] band.
+    The logical CommandState kept in the bridge state stays unchanged, so the
+    UI and mock trajectory still see left/right/winch in their intended sense.
+    """
+    # Swap channels: logical left -> physical right slot, logical right -> left.
+    physicalLeft = shape_motor_speed(command.rightSpeed)
+    physicalRight = shape_motor_speed(command.leftSpeed)
+    physicalWinch = -command.winchSpeed
+    return (
+        f"{physicalLeft},{physicalRight},"
+        f"{physicalWinch},{command.radarAngle}\n"
+    )
 
 
 @dataclass
@@ -59,6 +190,7 @@ class BridgeState:
     baudRate: int = 115200
     lastError: str = ""
     lastMessageAt: float | None = None
+    stale: bool = False
     telemetry: Telemetry = field(default_factory=Telemetry)
     command: CommandState = field(default_factory=CommandState)
 
@@ -71,7 +203,25 @@ class SerialBridge:
         self._stop_reader = threading.Event()
         self._mock_thread = threading.Thread(target=self._mock_loop, daemon=True)
         self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
         self._state = BridgeState()
+        # Wall-clock of the last command actually written to the serial port
+        # (from send_command OR the heartbeat). The heartbeat only retransmits
+        # when this is stale, so an actively-commanding UI never doubles the RF
+        # traffic — critical on the half-duplex link, where every extra shore TX
+        # is a window in which the boat's return telemetry collides and is lost.
+        self._last_serial_write_ts = 0.0
+        # Last successfully-connected port/baud, so the watchdog can reopen the
+        # link on its own when telemetry goes stale (real RF bridges hang).
+        self._last_port: str = ""
+        self._last_baud: int = 115200
+        self._last_reconnect_ts = 0.0
+        # Rolling per-channel history for median spike rejection on live sensors.
+        self._sensor_hist: dict[str, list[int]] = {
+            "usRadar": [], "usFront": [], "usLeft": [], "usRight": [],
+        }
+        # Index into IDLE_SWEEP_ANGLES used to keep the radar scanning at rest.
+        self._idle_sweep_i = 0
 
         # SSE fan-out: every connected stream client owns a bounded queue that
         # receives a fresh state snapshot whenever telemetry or state changes.
@@ -83,18 +233,23 @@ class SerialBridge:
         self._sim_boat_y = 0.0
         self._sim_boat_heading_rad = 0.0
         self._sim_boat_speed_cms = 0.0
+        self._sim_boat_turn_rate = 0.0  # rad/s (yaw carries angular momentum)
         self._sim_targets: list[dict] = []
+        self._sim_walls: list[dict] = []  # thin straight-line obstacles
         self._sim_last_ts = time.time()
-        # Rectangular boundary that exists in the mock world (half extents in cm)
-        self._sim_bounds_half_x = 600.0
-        self._sim_bounds_half_y = 450.0
+        # Rectangular pool boundary in the mock world (half extents in cm).
+        # Pool is 2.2 m wide (x) by 4.5 m long (y): the boat travels along the
+        # 4.5 m length (bottom -> top) and the baffle gaps sit across the 2.2 m width.
+        self._sim_bounds_half_x = 110.0
+        self._sim_bounds_half_y = 225.0
         # Active mock scenario + its start/goal points (world coords, cm).
-        self._sim_scenario = "serpentine"
+        self._sim_scenario = "rectangle"
         self._sim_start: dict | None = None
         self._sim_goal: dict | None = None
 
         self._mock_thread.start()
         self._heartbeat_thread.start()
+        self._watchdog_thread.start()
 
     def list_ports(self) -> list[str]:
         return [port.device for port in list_ports.comports()]
@@ -137,6 +292,12 @@ class SerialBridge:
             self._state.serialPort = port_name
             self._state.baudRate = baud_rate
             self._state.lastError = ""
+            self._last_port = port_name
+            self._last_baud = baud_rate
+            self._last_reconnect_ts = time.time()
+            # Grace period: mark data fresh at connect so the watchdog doesn't
+            # immediately re-trigger while the boat is still booting/streaming.
+            self._state.lastMessageAt = time.time()
             self._stop_reader.clear()
             self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
             self._reader_thread.start()
@@ -150,7 +311,7 @@ class SerialBridge:
             self._publish()
             return self.snapshot()
 
-    def set_mock_enabled(self, enabled: bool, scenario: str = "serpentine") -> BridgeState:
+    def set_mock_enabled(self, enabled: bool, scenario: str = "rectangle") -> BridgeState:
         with self._lock:
             if enabled:
                 self._disconnect_locked(send_stop=True)
@@ -160,8 +321,23 @@ class SerialBridge:
                 self._state.lastMessageAt = time.time()
                 self._state.command = CommandState()
                 self._sim_scenario = scenario
+                self._sim_walls = []
                 # Build the world and drop the boat at the scenario's start pose.
-                if scenario == "serpentine":
+                if scenario == "rectangle":
+                    # Rectangular pool with three baffle walls jutting from the
+                    # side walls. The boat starts bottom-left and the goal is the
+                    # top-left corner, so it must weave: up -> right (around the
+                    # lower baffle) -> up -> left (middle baffle) -> up -> right
+                    # (upper baffle) -> up.
+                    self._sim_targets = self._create_rectangle_targets()
+                    self._sim_boat_x = -(self._sim_bounds_half_x - 20)
+                    self._sim_boat_y = -(self._sim_bounds_half_y - 30)
+                    self._sim_boat_heading_rad = 0.0
+                    self._sim_goal = {
+                        "x": -(self._sim_bounds_half_x - 20),
+                        "y": self._sim_bounds_half_y - 30,
+                    }
+                elif scenario == "serpentine":
                     # Boustrophedon "maze": three baffle walls with alternating
                     # gaps. Boat starts bottom-left, goal is the top-right corner,
                     # so it must weave right-up-left-up-right to cross.
@@ -181,6 +357,7 @@ class SerialBridge:
                     self._sim_goal = None
                 self._sim_start = {"x": self._sim_boat_x, "y": self._sim_boat_y}
                 self._sim_boat_speed_cms = 0.0
+                self._sim_boat_turn_rate = 0.0
                 self._sim_last_ts = time.time()
                 self._state.telemetry = Telemetry(
                     usRadar=180, usFront=120, usLeft=95, usRight=105, radarAngle=90,
@@ -207,6 +384,10 @@ class SerialBridge:
                 "boundsHalfY": self._sim_bounds_half_y,
                 "maxRange": 450,
                 "targets": [dict(t) for t in self._sim_targets],
+                "walls": [
+                    {k: w[k] for k in ("x1", "y1", "x2", "y2", "thickness")}
+                    for w in self._sim_walls
+                ],
                 "scenario": self._sim_scenario,
                 "start": dict(self._sim_start) if self._sim_start else None,
                 "goal": dict(self._sim_goal) if self._sim_goal else None,
@@ -244,12 +425,16 @@ class SerialBridge:
                 radarAngle=clamp(int(payload.get("radarAngle", 90)), 0, 180),
             )
 
-            line = (
-                f"{command.leftSpeed},{command.rightSpeed},"
-                f"{command.winchSpeed},{command.radarAngle}\n"
-            )
+            line = build_serial_line(command)
+            now = time.time()
             if self._serial is not None and self._serial.is_open:
-                self._serial.write(line.encode("ascii"))
+                # Rate-limit PHYSICAL writes: a flood of UI commands can saturate
+                # the half-duplex RF link and freeze the boat's return telemetry.
+                # A skipped command still becomes state.command and is pushed out
+                # by the heartbeat within HEARTBEAT_INTERVAL_S, so none is lost.
+                if now - self._last_serial_write_ts >= SERIAL_MIN_WRITE_INTERVAL_S:
+                    self._serial.write(line.encode("ascii"))
+                    self._last_serial_write_ts = now
             self._state.command = command
             self._state.lastError = ""
             self._publish()
@@ -257,6 +442,12 @@ class SerialBridge:
 
     def snapshot(self) -> BridgeState:
         with self._lock:
+            last = self._state.lastMessageAt
+            is_stale = bool(
+                self._state.connected
+                and last is not None
+                and (time.time() - last) > TELEMETRY_STALE_S
+            )
             return BridgeState(
                 connected=self._state.connected,
                 mockEnabled=self._state.mockEnabled,
@@ -264,6 +455,7 @@ class SerialBridge:
                 baudRate=self._state.baudRate,
                 lastError=self._state.lastError,
                 lastMessageAt=self._state.lastMessageAt,
+                stale=is_stale,
                 telemetry=Telemetry(**asdict(self._state.telemetry)),
                 command=CommandState(**asdict(self._state.command)),
             )
@@ -303,17 +495,43 @@ class SerialBridge:
                     self._state.lastError = line
                     continue
 
+                # Discard the boat's diagnostic ack packet (all four sensor
+                # fields == 111). It only confirms the radio link is alive and
+                # would otherwise crowd out real sensor readings.
+                if values[0] == 111 and values[1] == 111 and values[2] == 111 and values[3] == 111:
+                    self._state.lastError = ""
+                    continue
+
                 self._state.telemetry = Telemetry(
-                    usRadar=values[0],
-                    usFront=values[1],
-                    usLeft=values[2],
-                    usRight=values[3],
+                    usRadar=self._smooth_reading("usRadar", filter_near_reading(values[0])),
+                    usFront=self._smooth_reading("usFront", filter_near_reading(values[1])),
+                    usLeft=self._smooth_reading("usLeft", filter_near_reading(values[2])),
+                    usRight=self._smooth_reading("usRight", filter_near_reading(values[3])),
                     radarAngle=values[4],
                     boatX=self._sim_boat_x,
                     boatY=self._sim_boat_y,
                 )
                 self._state.lastError = ""
                 self._publish()
+
+    def _smooth_reading(self, channel: str, value: int) -> int:
+        """Median-filter a live sensor channel to reject single-frame spikes.
+
+        Only in-range samples feed the median; if the whole window is
+        out-of-range the sentinel is returned unchanged. Keeps at most
+        SENSOR_MEDIAN_WINDOW recent samples per channel. Called under the lock
+        from the reader loop.
+        """
+        hist = self._sensor_hist.get(channel)
+        if hist is None:
+            return value
+        hist.append(value)
+        if len(hist) > SENSOR_MEDIAN_WINDOW:
+            del hist[0]
+        valid = sorted(v for v in hist if v < OUT_OF_RANGE_CM)
+        if not valid:
+            return value
+        return valid[len(valid) // 2]
 
     def _heartbeat_loop(self) -> None:
         """Periodically re-send the last command so the boat's failsafe stays armed.
@@ -325,20 +543,69 @@ class SerialBridge:
         what the UI last asked, while a genuine link loss still trips the failsafe.
         """
         while True:
-            time.sleep(HEARTBEAT_INTERVAL_S)
+            time.sleep(HEARTBEAT_INTERVAL_S / 2.0)
             with self._lock:
                 ser = self._serial
                 if ser is None or not ser.is_open:
                     continue
+                # Only retransmit if the UI hasn't sent a command recently. When
+                # the UI is actively driving (commands every ~250ms) this never
+                # fires, so the shore isn't flooded and the boat's return
+                # telemetry gets a clear window. It only kicks in as a failsafe
+                # keep-alive when the UI goes idle.
+                if time.time() - self._last_serial_write_ts < HEARTBEAT_INTERVAL_S:
+                    continue
                 command = self._state.command
-                line = (
-                    f"{command.leftSpeed},{command.rightSpeed},"
-                    f"{command.winchSpeed},{command.radarAngle}\n"
-                )
+                # Keep-alive radar sweep: while the boat is stopped its servo
+                # would sit still and telemetry would dry up (pings only stream
+                # during motion). Advance radarAngle each idle beat so the servo
+                # keeps scanning and fresh readings keep arriving even at rest.
+                if command.leftSpeed == 0 and command.rightSpeed == 0:
+                    self._idle_sweep_i = (self._idle_sweep_i + 1) % len(IDLE_SWEEP_ANGLES)
+                    command = CommandState(
+                        leftSpeed=0, rightSpeed=0, winchSpeed=command.winchSpeed,
+                        radarAngle=IDLE_SWEEP_ANGLES[self._idle_sweep_i],
+                    )
+                    self._state.command = command
+                line = build_serial_line(command)
                 try:
                     ser.write(line.encode("ascii"))
+                    self._last_serial_write_ts = time.time()
                 except Exception:
                     pass
+
+    def _watchdog_loop(self) -> None:
+        """Revive the telemetry stream when it goes stale on the real link.
+
+        The radio bridge can hang (observed: lastMessageAt frozen for many
+        seconds while still 'connected'). Reopening the serial port toggles DTR
+        and resets the bridge, restoring the stream. We do this at most once per
+        RECONNECT_COOLDOWN_S so a genuinely dead link isn't thrashed on every
+        tick (repeated fast reconnects never let the boat finish booting).
+        """
+        while True:
+            time.sleep(1.0)
+            with self._lock:
+                connected = self._state.connected
+                ser = self._serial
+                last = self._state.lastMessageAt
+                port = self._last_port
+                baud = self._last_baud
+                since_reconnect = time.time() - self._last_reconnect_ts
+            if not connected or ser is None or last is None or not port:
+                continue
+            if (time.time() - last) <= TELEMETRY_STALE_S:
+                continue
+            if since_reconnect < RECONNECT_COOLDOWN_S:
+                continue
+            with self._lock:
+                self._state.lastError = "watchdog: telemetry stale \u2014 reopening port"
+            try:
+                self.connect(port, baud)
+            except Exception as exc:
+                with self._lock:
+                    self._state.lastError = f"watchdog reconnect failed: {exc}"
+                    self._last_reconnect_ts = time.time()
 
     def _mock_loop(self) -> None:
         import random
@@ -353,18 +620,32 @@ class SerialBridge:
                 dt = max(0.01, now - self._sim_last_ts)
                 self._sim_last_ts = now
                 
-                # Update boat dynamics from joystick commands
+                # Update boat dynamics from joystick commands. The real boat can
+                # only ever drive each motor at 0 or within [70, 100]
+                # (build_serial_line shapes every packet), so the simulated hull
+                # must obey the SAME shaping — otherwise the sim would move
+                # differently than the boat ever can. This also shapes the
+                # autonomous controller, which drives through this exact physics.
+                left_cmd = shape_motor_speed(self._state.command.leftSpeed)
+                right_cmd = shape_motor_speed(self._state.command.rightSpeed)
                 # Throttle: average of left and right speeds (0-1 range)
-                throttle = (self._state.command.leftSpeed + self._state.command.rightSpeed) / (2 * 255)
+                throttle = (left_cmd + right_cmd) / (2 * 255)
                 # Turn: difference of left and right speeds (rotation)
-                turn = (self._state.command.rightSpeed - self._state.command.leftSpeed) / (2 * 255)
-                
-                # Update boat speed (smooth acceleration)
-                target_speed = throttle * 45  # Max 45 cm/s (physical hull limit)
-                self._sim_boat_speed_cms += (target_speed - self._sim_boat_speed_cms) * 0.24 * dt / 0.05
-                
-                # Update boat heading based on turn
-                self._sim_boat_heading_rad += turn * (math.pi * 0.25) * dt
+                turn = (right_cmd - left_cmd) / (2 * 255)
+
+                # Linear momentum: thrust from the motors fights water drag, so
+                # the hull glides on after the throttle drops instead of stopping
+                # dead. Steady state (thrust == drag) gives throttle * max speed,
+                # preserving the 45 cm/s cap while adding a ~0.7 s coast.
+                thrust = throttle * MOCK_MAX_SPEED_CMS * MOCK_LINEAR_DRAG
+                self._sim_boat_speed_cms += (thrust - MOCK_LINEAR_DRAG * self._sim_boat_speed_cms) * dt
+
+                # Angular momentum: the yaw rate eases toward the commanded rate
+                # (and keeps spinning briefly after the command changes) rather
+                # than snapping instantly, so turns overshoot like a real hull.
+                target_turn_rate = turn * MOCK_TURN_RATE
+                self._sim_boat_turn_rate += (target_turn_rate - self._sim_boat_turn_rate) * MOCK_TURN_DRAG * dt
+                self._sim_boat_heading_rad += self._sim_boat_turn_rate * dt
                 # Normalize angle to [0, 2π)
                 while self._sim_boat_heading_rad < 0:
                     self._sim_boat_heading_rad += 2 * math.pi
@@ -398,6 +679,15 @@ class SerialBridge:
                 us_back = self._cast_sensor_ray(boat_heading_deg + sweep + 180, fov_deg, max_range)
                 us_left = self._cast_sensor_ray(boat_heading_deg + sweep + 270, fov_deg, max_range)
 
+                # Real ultrasonic hardware is noisy: an occasional ping returns no
+                # echo at all, another comes back as a phantom short reading, and
+                # every good ping jitters a few cm. Inject that here so the nav
+                # stack has to cope with dirty data exactly like on the water.
+                us_front = self._noisy_reading(us_front, random, max_range)
+                us_right = self._noisy_reading(us_right, random, max_range)
+                us_back = self._noisy_reading(us_back, random, max_range)
+                us_left = self._noisy_reading(us_left, random, max_range)
+
                 # Telemetry matches the 5-field serial protocol; the extra boat
                 # pose fields are simulation-only helpers (not on the real wire).
                 # usRadar carries the rear-facing sensor at servo home (0°).
@@ -415,32 +705,90 @@ class SerialBridge:
                 self._state.connected = False
             self._publish()
 
+    def _noisy_reading(self, value: int, rng, max_range: int) -> int:
+        """Corrupt one clean sensor reading the way real hardware would.
+
+        Models three failure modes seen on cheap ultrasonic rangefinders:
+          * dropout  — no echo returns, the driver reports out-of-range (999);
+          * spike    — cross-talk / a passing wave fakes a short reading;
+          * jitter   — every genuine echo wobbles a couple of cm.
+        """
+        roll = rng.random()
+        if roll < MOCK_SENSOR_DROPOUT_P:
+            return OUT_OF_RANGE_CM
+        if roll < MOCK_SENSOR_DROPOUT_P + MOCK_SENSOR_SPIKE_P:
+            return int(rng.uniform(MIN_VALID_DISTANCE_CM * 2, 80))
+        if value >= OUT_OF_RANGE_CM:
+            return OUT_OF_RANGE_CM
+        noisy = value + rng.gauss(0.0, MOCK_SENSOR_JITTER_CM)
+        return int(round(max(MIN_VALID_DISTANCE_CM * 2, min(max_range, noisy))))
+
+    def _make_wall(self, x1: float, y1: float, x2: float, y2: float) -> dict:
+        """A thin straight-line obstacle plus a cached row of sample points.
+
+        Obstacles in the real pool are straight baffle walls, not blobs. We keep
+        the segment endpoints for drawing/serialisation and pre-sample the
+        centreline into overlapping points (each a disc of radius thickness/2)
+        so the existing point-based ray caster sees one continuous 5 cm barrier.
+        """
+        thickness = MOCK_WALL_THICKNESS_CM
+        radius = thickness / 2.0
+        length = math.hypot(x2 - x1, y2 - y1)
+        step = 3.0  # < 2*radius so the discs overlap into a solid line
+        n = max(1, int(round(length / step)))
+        pts = []
+        for i in range(n + 1):
+            t = i / n
+            pts.append({
+                "x": x1 + (x2 - x1) * t,
+                "y": y1 + (y2 - y1) * t,
+                "radius": radius,
+            })
+        return {
+            "x1": float(x1), "y1": float(y1),
+            "x2": float(x2), "y2": float(y2),
+            "thickness": thickness,
+            "_pts": pts,
+        }
+
+    def _create_rectangle_targets(self) -> list[dict]:
+        """Three thin straight baffle walls inside the rectangular pool.
+
+        Each wall is a single 5 cm-thick line segment spanning part of the 2.2 m
+        width. The lower baffle grows from the LEFT wall (gap on the right); the
+        middle baffle grows from the RIGHT wall (gap on the left); the upper
+        baffle grows from the LEFT wall again (gap on the right). Crossing from
+        the bottom-left start to the top-left goal forces a weave:
+        up -> right -> up -> left -> up -> right -> up.
+
+          baffle1 wall LEFT,  tip x=-35 -> gap x > -35  (forces boat RIGHT)
+          baffle2 wall RIGHT, tip x=+35 -> gap x < +35  (boat back toward LEFT)
+          baffle3 wall LEFT,  tip x=-35 -> gap x > -35  (forces boat RIGHT again)
+        """
+        hx = self._sim_bounds_half_x
+        self._sim_walls = [
+            self._make_wall(-hx, -70.0, -35.0, -70.0),  # lower baffle:  wall LEFT
+            self._make_wall(hx, 0.0, 35.0, 0.0),        # middle baffle: wall RIGHT
+            self._make_wall(-hx, 70.0, -35.0, 70.0),    # upper baffle:  wall LEFT
+        ]
+        return []  # geometry lives in self._sim_walls, not as circle bodies
+
+
     def _create_serpentine_targets(self) -> list[dict]:
         """Three baffle walls forming a boustrophedon course (see the sketch).
 
-        Each wall is a dense row of overlapping circles so the ultrasonic rays
-        see a continuous barrier. The gaps alternate side to side, so the only
-        way from the bottom-left start to the top-right goal is to weave:
-        right -> up -> left -> up -> right -> up.
+        Each wall is a single thin straight segment. The gaps alternate side to
+        side, so the only way from the bottom-left start to the top-right goal is
+        to weave: right -> up -> left -> up -> right -> up.
         """
         hx = self._sim_bounds_half_x
-        radius = 26.0
-        spacing = 34.0
+        self._sim_walls = [
+            self._make_wall(-hx, -225.0, 230.0, -225.0),  # lower divider: gap RIGHT
+            self._make_wall(hx, 0.0, -230.0, 0.0),        # middle divider: gap LEFT
+            self._make_wall(-hx, 225.0, 230.0, 225.0),    # upper divider: gap RIGHT
+        ]
+        return []  # geometry lives in self._sim_walls, not as circle bodies
 
-        def add_wall(targets: list[dict], y: float, x_from: float, x_to: float) -> None:
-            step = spacing if x_to >= x_from else -spacing
-            n = int(abs(x_to - x_from) / spacing)
-            for i in range(n + 1):
-                xi = x_from + step * i
-                targets.append({"x": float(xi), "y": float(y), "radius": radius})
-            targets.append({"x": float(x_to), "y": float(y), "radius": radius})
-
-        targets: list[dict] = []
-        # y splits the pool into 4 lanes (~225 cm tall each).
-        add_wall(targets, -225.0, -hx, 230.0)   # lower divider: wall on LEFT,  gap RIGHT
-        add_wall(targets, 0.0, hx, -230.0)       # middle divider: wall on RIGHT, gap LEFT
-        add_wall(targets, 225.0, -hx, 230.0)     # upper divider: wall on LEFT,  gap RIGHT
-        return targets
 
     def _create_random_targets(self, count: int) -> list[dict]:
         import random
@@ -503,7 +851,14 @@ class SerialBridge:
         if wall_dist <= max_range:
             nearest = wall_dist
 
-        for target in self._sim_targets:
+        # Circle bodies (random scenario) plus the sampled points that make up
+        # every thin straight-line baffle wall. Both are treated as discs: the
+        # ray echoes off the nearest surface anywhere inside the beam cone.
+        point_sources = list(self._sim_targets)
+        for wall in self._sim_walls:
+            point_sources.extend(wall["_pts"])
+
+        for target in point_sources:
             dx = target['x'] - self._sim_boat_x
             dy = target['y'] - self._sim_boat_y
 
@@ -586,12 +941,18 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
 
             if self.path == "/api/mock":
                 enabled = bool(body.get("enabled", False))
-                scenario = str(body.get("scenario", "serpentine"))
+                scenario = str(body.get("scenario", "rectangle"))
                 self._send_json({"state": asdict(BRIDGE.set_mock_enabled(enabled, scenario))})
                 return
 
             if self.path == "/api/command":
                 self._send_json({"state": asdict(BRIDGE.send_command(body))})
+                return
+
+            if self.path == "/api/navlog":
+                records = body.get("records", []) or []
+                fname = navlog_append(records, reset=bool(body.get("reset")))
+                self._send_json({"ok": True, "count": len(records), "file": fname})
                 return
 
             self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)

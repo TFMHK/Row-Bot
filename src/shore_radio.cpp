@@ -1,7 +1,7 @@
 #include <RH_ASK.h>
 
-// רדיו: speed=2000bps, rxPin=11, txPin=10
-RH_ASK driver(2000, 11, 10);
+// רדיו: speed=4000bps, rxPin=11, txPin=10 (חייב להתאים לקצב של הסירה)
+RH_ASK driver(4000, 11, 10);
 
 struct CommandPacket {
   int leftSpeed;
