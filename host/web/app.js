@@ -266,6 +266,14 @@ const RADAR_DISPLAY_TTL_MS = 12000;
 // לאסוף >=3 נקודות על הסריקה האיטית, אבל לא ארוך מדי כדי שנקודות מפוזרות על פני
 // תנועת הסירה (דד-רקונינג גס) ימרחו את הקו. הקטע שהותאם נשמר אח"כ WALL_TTL_MS.
 const RADAR_WALL_FIT_TTL_MS = 6000;
+// מילוי-פער זוויתי (חומרה אמיתית בלבד): הסרבו סורק קשת מלאה ~פעם בשנייה, אבל ה-RF
+// מביא רק ~1-3 פאקטות לשנייה, אז רוב הזוויות שנסרקו אף פעם לא מגיעות. כשמגיעה פאקטה
+// חדשה, "צובעים" את הפער הזוויתי מאז הפאקטה הקודמת באינטרפולציה ליניארית בין שתי
+// הקריאות — כך פאקטה אחת ממלאת קשת שלמה במקום סלוט 15° בודד. הנקודות הממולאות
+// מסומנות filled ומשמשות לתצוגה בלבד (לעולם לא מזינות את הניווט).
+const RADAR_GAPFILL_MAX_MS = 1200;       // ממלאים רק אם הפער בזמן קטן (אחרת האינטרפולציה חסרת משמעות)
+const RADAR_GAPFILL_STEP_DEG = 5;        // רזולוציית המילוי
+const RADAR_GAPFILL_MAX_SPAN_DEG = 80;   // לא ממלאים פער זוויתי רחב מדי (כנראה קפיצה/באונס)
 // כשמאבדים תקשורת (לא מגיע פריים טלמטריה חדש) חייבים להמשיך לראות את תמונת המכ"ם
 // האחרונה במקום שהיא תדעך לריק. ה-TTL נועד לפוג בלימים שלא רועננו בזמן שהסריקה
 // *ממשיכה* — אבל אם הסריקה עצמה נעצרה (אין תקשורת), אין מה שיחליף אותם, אז מקפיאים
@@ -1089,6 +1097,7 @@ function getMemoryDistance(bearingDeg, toleranceDeg) {
   // which would drag the obstacle along with the boat.
   const now = performance.now();
   for (const [absSlot, entry] of radarMemory) {
+    if (entry.filled) continue; // interpolated gap-fill = display only, never nav
     if (!entry.value || entry.value >= 999 || now - entry.t > RADAR_TTL_MS) continue;
     consider(entry.wx, entry.wy);
   }
@@ -2589,6 +2598,13 @@ const SENSOR_BEAMS = [
 // rings or arcs that never existed in the world.
 const radarMemory = new Map();
 
+// Gap-fill bookkeeping: the last received servo angle + per-sensor value + time,
+// so a newly arrived packet can paint the angular arc swept since the previous
+// one (real-HW only; see updateRadarMemory).
+let prevSweepDeg = null;
+let prevSweepT = 0;
+const prevBeamVal = {};
+
 // Wall-clock (performance.now) of the last GENUINE telemetry frame folded into
 // the radar picture. Only updated inside updateRadarMemory, which runs solely
 // when the boat is connected/mock, so a comms dropout stops it advancing.
@@ -2619,6 +2635,9 @@ const radarWalls = new Map();
 
 function resetRadarWalls() {
   radarWalls.clear();
+  prevSweepDeg = null;
+  prevSweepT = 0;
+  for (const k of Object.keys(prevBeamVal)) delete prevBeamVal[k];
 }
 
 // Per-side linear interpolation. Groups the currently-live raw detections by
@@ -2639,15 +2658,14 @@ function updateRadarWalls() {
 
   // Bucket live, valid detections into the 4 sensor sides. slot - heading is
   // heading-independent (all sensors rotate with the boat), so a side always
-  // collects the same sensor's arc even while turning. Fitting uses a MODERATE
-  // window (RADAR_WALL_FIT_TTL_MS) — long enough for the slow real-HW sweep to
-  // gather >=3 points per side, but short enough that a moving boat's dead-
-  // reckoning drift doesn't smear the fitted line. (Individual dots persist much
-  // longer via pruneRadarMemory/RADAR_DISPLAY_TTL_MS.) Each point is flagged
-  // `fresh` (<= RADAR_TTL_MS) so only genuinely fresh returns feed the nav-facing
-  // liveScan below — autonomy never acts on a stale bearing.
+  // collects the same sensor's arc even while turning. Only REAL measured
+  // returns feed the geometry (filled gap-fill points are display-only blips).
+  // Each point is flagged `fresh` (<= RADAR_TTL_MS) so only genuinely fresh
+  // returns feed the nav-facing liveScan below — autonomy never acts on a stale
+  // bearing.
   const sides = [[], [], [], []];
   for (const [slot, e] of radarMemory) {
+    if (e.filled) continue;
     if (!e.value || e.value >= 999 || now - e.t > RADAR_WALL_FIT_TTL_MS) continue;
     if (e.value > sim.maxRange) continue;
     const rel = normalizeDeg(slot - heading); // 0..360 from bow
@@ -2655,70 +2673,151 @@ function updateRadarWalls() {
     sides[side].push({ bearingRel: wrap180(rel), r: e.value, fresh: now - e.t <= RADAR_TTL_MS });
   }
 
+  // --- PHASE 1: per-side geometry stats (bow-frame cartesian) --------------
+  // The 4 ultrasonic sensors are mounted 90° apart, so in a rectangular basin
+  // the walls they see are constrained to lie along a common grid (each wall is
+  // parallel or perpendicular to the others). We exploit that: first measure
+  // each side's raw orientation independently, then in PHASE 2 fuse them into a
+  // single grid orientation φ, so even a side with only 1–2 points can be placed
+  // by borrowing the orientation the OTHER sensors agreed on.
+  const stat = [null, null, null, null];
   for (let side = 0; side < 4; side += 1) {
     const pts = sides[side];
-    if (pts.length < RADAR_FIT_MIN_POINTS) {
-      radarWalls.delete(side);
-      continue;
-    }
-    // Local Cartesian, bow frame: x = r·sinβ (right), y = r·cosβ (forward).
+    if (pts.length === 0) continue;
     const xy = pts.map((p) => {
       const a = degToRad(p.bearingRel);
       return { b: p.bearingRel, x: Math.sin(a) * p.r, y: Math.cos(a) * p.r, fresh: p.fresh };
     });
     let mx = 0;
     let my = 0;
+    let bs = 0;
+    let bc = 0;
     for (const q of xy) {
       mx += q.x;
       my += q.y;
+      bs += Math.sin(degToRad(q.b));
+      bc += Math.cos(degToRad(q.b));
     }
     mx /= xy.length;
     my /= xy.length;
-    let Sxx = 0;
-    let Syy = 0;
-    let Sxy = 0;
-    for (const q of xy) {
-      const dx = q.x - mx;
-      const dy = q.y - my;
-      Sxx += dx * dx;
-      Syy += dy * dy;
-      Sxy += dx * dy;
-    }
-    // Principal axis = line direction (ux,uy); its normal is (nx,ny).
-    const theta = 0.5 * Math.atan2(2 * Sxy, Sxx - Syy);
-    const ux = Math.cos(theta);
-    const uy = Math.sin(theta);
-    const nx = -uy;
-    const ny = ux;
-    // Reject sides whose points don't lie on a line (scattered bodies / open
-    // water), so we never draw a wall that isn't there.
+    const repBearing = Math.atan2(bs, bc); // circular-mean view bearing (rad)
+    let theta = null;
     let res = 0;
-    for (const q of xy) {
-      const d = (q.x - mx) * nx + (q.y - my) * ny;
-      res += d * d;
+    if (xy.length >= 2) {
+      let Sxx = 0;
+      let Syy = 0;
+      let Sxy = 0;
+      for (const q of xy) {
+        const dx = q.x - mx;
+        const dy = q.y - my;
+        Sxx += dx * dx;
+        Syy += dy * dy;
+        Sxy += dx * dy;
+      }
+      theta = 0.5 * Math.atan2(2 * Sxy, Sxx - Syy);
+      const nnx = -Math.sin(theta);
+      const nny = Math.cos(theta);
+      for (const q of xy) res += ((q.x - mx) * nnx + (q.y - my) * nny) ** 2;
+      res = Math.sqrt(res / xy.length);
     }
-    res = Math.sqrt(res / xy.length);
-    if (res > RADAR_FIT_MAX_RESIDUAL_CM) {
+    stat[side] = { xy, count: xy.length, theta, res, repBearing };
+  }
+
+  // --- PHASE 2: shared grid orientation φ ---------------------------------
+  // Circular mean of the line orientations folded into the orthogonal family
+  // (angle × 4, since a grid repeats every 90°). Scattered sides (>=3 pts but
+  // high residual) don't vote. Weight by point count so well-seen walls dominate.
+  let Ssin = 0;
+  let Scos = 0;
+  for (let side = 0; side < 4; side += 1) {
+    const s = stat[side];
+    if (!s || s.theta === null) continue;
+    if (s.count >= 3 && s.res > RADAR_FIT_MAX_RESIDUAL_CM) continue;
+    Ssin += s.count * Math.sin(4 * s.theta);
+    Scos += s.count * Math.cos(4 * s.theta);
+  }
+  const phi = Ssin !== 0 || Scos !== 0 ? Math.atan2(Ssin, Scos) / 4 : null;
+
+  // Snap an orientation onto the nearest of the two grid axes {φ, φ+90°}.
+  const snapToGrid = (thetaRad) => {
+    let best = phi;
+    let bestD = Infinity;
+    for (const cand of [phi, phi + Math.PI / 2]) {
+      let d = ((thetaRad - cand) % Math.PI + Math.PI) % Math.PI;
+      if (d > Math.PI / 2) d = Math.PI - d;
+      if (d < bestD) {
+        bestD = d;
+        best = cand;
+      }
+    }
+    return best;
+  };
+
+  const toWorld = (px, py) => {
+    const r = Math.hypot(px, py);
+    const b = (Math.atan2(px, py) * 180) / Math.PI; // bow-relative bearing
+    const wb = degToRad(heading + b);
+    return { x: bx + Math.sin(wb) * r, y: by + Math.cos(wb) * r };
+  };
+  const toBow = (wx, wy) => {
+    const dx = wx - bx;
+    const dy = wy - by;
+    const r = Math.hypot(dx, dy);
+    const b = degToRad(normalizeDeg((Math.atan2(dx, dy) * 180) / Math.PI) - heading);
+    return { x: Math.sin(b) * r, y: Math.cos(b) * r };
+  };
+
+  // --- PHASE 3: place each side's wall ------------------------------------
+  const SEG_MIN_LEN_CM = 30; // default half-visible extent when a side is sparse
+  for (let side = 0; side < 4; side += 1) {
+    const s = stat[side];
+    if (!s) {
       radarWalls.delete(side);
       continue;
     }
-    // Extent of the visible segment along the fitted line.
+    const xy = s.xy;
+    // Decide the wall orientation O and whether to draw at all.
+    let O = null;
+    if (s.count >= RADAR_FIT_MIN_POINTS) {
+      if (s.res > RADAR_FIT_MAX_RESIDUAL_CM) {
+        // Points don't lie on a line (scattered bodies / open water) — not a wall.
+        radarWalls.delete(side);
+        continue;
+      }
+      O = phi !== null ? snapToGrid(s.theta) : s.theta;
+    } else if (phi !== null) {
+      // Sparse side (1–2 pts): rescue it using the shared grid orientation. With
+      // 2 pts use their own chord; with 1 pt assume the wall is perpendicular to
+      // the sensor's view bearing (a head-on wall), then snap to the grid.
+      const prior = s.count >= 2 && s.theta !== null ? s.theta : s.repBearing + Math.PI / 2;
+      O = snapToGrid(prior);
+    } else {
+      radarWalls.delete(side);
+      continue;
+    }
+    // Fixed-orientation line: direction u, normal n, absolute offset c (median of
+    // the point projections onto n) so it's stable even with a single point.
+    const ux = Math.cos(O);
+    const uy = Math.sin(O);
+    const nx = -uy;
+    const ny = ux;
+    const cs = xy.map((q) => q.x * nx + q.y * ny).sort((a, b) => a - b);
+    const c = cs[cs.length >> 1];
     let tMin = Infinity;
     let tMax = -Infinity;
     for (const q of xy) {
-      const t = (q.x - mx) * ux + (q.y - my) * uy;
+      const t = q.x * ux + q.y * uy;
       if (t < tMin) tMin = t;
       if (t > tMax) tMax = t;
     }
+    if (tMax - tMin < SEG_MIN_LEN_CM) {
+      const tc = (tMin + tMax) / 2;
+      tMin = tc - SEG_MIN_LEN_CM / 2;
+      tMax = tc + SEG_MIN_LEN_CM / 2;
+    }
     // Segment endpoints (bow frame) -> frozen world coordinates.
-    const toWorld = (px, py) => {
-      const r = Math.hypot(px, py);
-      const b = (Math.atan2(px, py) * 180) / Math.PI; // bow-relative bearing
-      const wb = degToRad(heading + b);
-      return { x: bx + Math.sin(wb) * r, y: by + Math.cos(wb) * r };
-    };
-    let w1 = toWorld(mx + tMin * ux, my + tMin * uy);
-    let w2 = toWorld(mx + tMax * ux, my + tMax * uy);
+    let w1 = toWorld(c * nx + tMin * ux, c * ny + tMin * uy);
+    let w2 = toWorld(c * nx + tMax * ux, c * ny + tMax * uy);
 
     // Temporal smoothing in WORLD frame: a real wall barely moves, so EMA the
     // endpoints (matching new ends to the nearest previous ends, since the fit's
@@ -2741,16 +2840,9 @@ function updateRadarWalls() {
     radarWalls.set(side, { x1: w1.x, y1: w1.y, x2: w2.x, y2: w2.y, t: now });
 
     // Feed the nav from the SMOOTHED line: convert the (smoothed) world endpoints
-    // back to the current bow frame, rebuild the line there, then push each
+    // back to the current bow frame, rebuild the line there, then push each FRESH
     // bearing's corrected range into liveScan. This makes liveCone rely on the
     // same steady wall the display shows, so smoothing helps autonomy too.
-    const toBow = (wx, wy) => {
-      const dx = wx - bx;
-      const dy = wy - by;
-      const r = Math.hypot(dx, dy);
-      const b = degToRad(normalizeDeg((Math.atan2(dx, dy) * 180) / Math.PI) - heading);
-      return { x: Math.sin(b) * r, y: Math.cos(b) * r };
-    };
     const p1 = toBow(w1.x, w1.y);
     const p2 = toBow(w2.x, w2.y);
     let sux = p2.x - p1.x;
@@ -2800,6 +2892,49 @@ function updateRadarMemory() {
   // tracks real time. When frames stop, this stops advancing and the display
   // ageing clock freezes, keeping the last radar picture visible.
   lastRadarFreshAt = now;
+  // --- Angular gap-fill (real HW only, DISPLAY-only) ----------------------
+  // The servo sweeps a full arc ~1×/s but RF delivers only ~1-3 packets/s, so
+  // most swept angles never arrive and the picture strobes. When a new packet
+  // lands, paint the angular gap since the previous packet with a linear
+  // interpolation between the two readings — one packet fills a whole arc. These
+  // points are marked filled:true: they render as blips (and give the noise
+  // filter neighbours so real dots stop flickering) but are EXCLUDED from wall
+  // fitting and from nav — the navigator never acts on an interpolated guess.
+  if (!state.mockEnabled && prevSweepDeg !== null) {
+    const dt = now - prevSweepT;
+    const span = sweep - prevSweepDeg;
+    const aspan = Math.abs(span);
+    if (
+      dt > 0 &&
+      dt <= RADAR_GAPFILL_MAX_MS &&
+      aspan > RADAR_GAPFILL_STEP_DEG &&
+      aspan <= RADAR_GAPFILL_MAX_SPAN_DEG
+    ) {
+      const steps = Math.floor(aspan / RADAR_GAPFILL_STEP_DEG);
+      const dir = span > 0 ? 1 : -1;
+      for (let i = 1; i < steps; i += 1) {
+        const s = prevSweepDeg + dir * i * RADAR_GAPFILL_STEP_DEG;
+        const frac = (s - prevSweepDeg) / span; // 0..1
+        for (const beam of SENSOR_BEAMS) {
+          const pv = prevBeamVal[beam.key];
+          const nv = state.telemetry[beam.key];
+          if (pv == null || nv == null || pv >= 999 || nv >= 999) continue;
+          const absSlot = normalizeDeg(heading + beam.dir + s);
+          const ex = radarMemory.get(absSlot);
+          if (ex && !ex.filled) continue; // never clobber a real measurement
+          const val = pv + (nv - pv) * frac;
+          const rad = degToRad(absSlot);
+          radarMemory.set(absSlot, {
+            value: val,
+            wx: bx + Math.sin(rad) * val,
+            wy: by + Math.cos(rad) * val,
+            t: now,
+            filled: true,
+          });
+        }
+      }
+    }
+  }
   for (const beam of SENSOR_BEAMS) {
     const absSlot = normalizeDeg(heading + beam.dir + sweep);
     const newVal = state.telemetry[beam.key];
@@ -2821,6 +2956,10 @@ function updateRadarMemory() {
     const wy = by + Math.cos(rad) * value;
     radarMemory.set(absSlot, { value, wx, wy, t: now });
   }
+  // Remember this packet's servo angle + per-sensor ranges for the next gap-fill.
+  prevSweepDeg = sweep;
+  prevSweepT = now;
+  for (const beam of SENSOR_BEAMS) prevBeamVal[beam.key] = state.telemetry[beam.key];
 }
 
 // Remove slots whose last real measurement is older than the DISPLAY TTL. Uses
