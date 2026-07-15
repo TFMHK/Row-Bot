@@ -8,6 +8,7 @@ const mockSwitch = document.getElementById("mockSwitch");
 const portSelect = document.getElementById("portSelect");
 const refreshPortsBtn = document.getElementById("refreshPortsBtn");
 const serverMessage = document.getElementById("serverMessage");
+const downloadNavBtn = document.getElementById("downloadNavBtn");
 
 const leftSpeedValue = document.getElementById("leftSpeedValue");
 const rightSpeedValue = document.getElementById("rightSpeedValue");
@@ -389,6 +390,11 @@ mockSwitch.addEventListener("change", onMockToggle);
 mapClearBtn.addEventListener("click", clearRadarMap);
 motorLeftAbsInput.addEventListener("change", () => sendMotorConfig("motorLeftAbs", motorLeftAbsInput));
 motorRightAbsInput.addEventListener("change", () => sendMotorConfig("motorRightAbs", motorRightAbsInput));
+if (downloadNavBtn) {
+  downloadNavBtn.addEventListener("click", () => {
+    if (window.LocalBridge) LocalBridge.downloadNavLog();
+  });
+}
 
 setupJoystick();
 setupWinchJoystick();
@@ -414,6 +420,9 @@ async function detectServerMode() {
     /* no server reachable -> fall through to serverless */
   }
   SERVERLESS = true;
+  // The autonomous nav log is written to disk by the server; without one, offer
+  // a client-side download of the in-memory NDJSON instead.
+  if (downloadNavBtn) downloadNavBtn.hidden = false;
   if (!("serial" in navigator)) {
     setServerMessage(
       "הדפדפן הזה לא תומך ב-Web Serial. השתמש ב-Chrome באנדרואיד, או הדלק 'מוק דאטא' לבדיקה.",
