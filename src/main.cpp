@@ -2,14 +2,18 @@
 #include <Servo.h>
 #include <Adafruit_NeoPixel.h>
 
-// רדיו: speed=4000bps, rxPin=7, txPin=4 (הועלה מ-2000 להאצת הלינק; שני הקצוות תואמים)
+// רדיו: speed=2000bps, rxPin=7, txPin=4 (שני הקצות חייבים להתאים!)
+// קצב נמוך => מקלט ASK רגיש יותר => טווח טוב יותר. מחיר: זמן-שידור
+// לפאקטה מוכפל (~150ms) – לכן ה-heartbeat בשרת הוגדל ל-400ms כדי שה-round-trip ייכנס.
 // (ה-TX עבר מ-D6 ל-D4 כדי לפנות את D6 ל-PWM של מנוע)
-RH_ASK driver(4000, 7, 4);
+RH_ASK driver(2000, 7, 4);
 
-// לד ניאו-פיקסל יחיד על D1 לחיווי מצב (קשר/תנועה/failsafe).
-// D1 פנוי בסירה כי אין שימוש ב-Serial (התקשורת היא RF בלבד).
-const int PIXEL_PIN = 1;
-const int PIXEL_COUNT = 1;
+// טבעת ניאו-פיקסל (8 לדים) על D11 לחיווי מצב + שליטה מרחוק בצבע.
+// הועבר מ-D1 ל-D11: D1 הוא קו ה-TX של ה-USART ומוחזק HIGH במנוחה, ולכן אות ה-
+// DATA של ה-NeoPixel (שדורש מנוחה LOW ותזמון מדויק) משתבש ואף לד לא נדלק.
+// D11 הוא פין דיגיטלי פנוי ונקי בסירה.
+const int PIXEL_PIN = 11;
+const int PIXEL_COUNT = 8;
 Adafruit_NeoPixel pixel(PIXEL_COUNT, PIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
 // סרוו המכם על D3 (מונע על-ידי Timer1 דרך ספריית Servo)
@@ -68,6 +72,7 @@ struct CommandPacket {
   int rightSpeed;
   int winchSpeed;
   int radarAngle;
+  int mode;           // 0 = ידני (ירוק), 1 = אוטומטי (כחול) — צבע הטבעת
 };
 
 struct TelemetryPacket {
@@ -78,25 +83,48 @@ struct TelemetryPacket {
   int radarAngle;
 };
 
-CommandPacket cmd = {0, 0, 0, 90};
+CommandPacket cmd = {0, 0, 0, 90, 0};
 TelemetryPacket telemetry;
 
 // Failsafe: אם לא מתקבלת פקודה תקינה תוך פרק הזמן הזה (למשל אובדן קשר RF),
 // המנועים נעצרים אוטומטית כדי שהסירה לא תמשיך לנוע "בעיוורון" עד לריסט.
-const unsigned long FAILSAFE_TIMEOUT_MS = 800;
+// הועלה מ-800 ל-1500ms כדי "לרכוב מעל" דעיכות RF קצרות (טווח) בלי לעצור מנועים.
+const unsigned long FAILSAFE_TIMEOUT_MS = 1500;
 unsigned long lastCommandMs = 0;
 bool motorsStopped = true;
+// כשאבד קשר (failsafe) הטבעת מוצגת אדומה קבוע כחיווי בטיחות.
+bool linkLost = false;
+// המצב האחרון שהוצג על הטבעת (0=ידני,1=אוטומטי). -1 = טרם הוצג,
+// מאלץ ציור ראשון. show() מתבצע רק כשהערך הזה משתנה — אירוע נדיר.
+int lastMode = -1;
+
+// --- חיווי כיוון על טבעת הלדים (כמו מצפן) ---
+// הטבעת מצביעה לכיוון התנועה הנגזר מפקודות המנועים (כיוון הג'ויסטיק):
+// קדימה → לד קדמי, פנייה ימינה/שמאלה → צד, אחורה → לד אחורי.
+// כשהסירה עומדת (אין פקודה) — הטבעת כבויה.
+// LED 0 = חזית הסירה. RING_OFFSET מסובב את המיפוי אם הטבעת מורכבת מסובבת
+// פיזית (כל יחידה = 45°). RING_CW=+1 אם הלדים עולים עם כיוון השעון, -1 אם נגדו.
+const int RING_OFFSET = 0;
+const int RING_CW = 1;
+// מתחת לסף התנועה הזה נחשבת עמידה — הטבעת כבויה.
+const int MOTION_DEADZONE = 20;
 
 // שידור-גיבוי עצמאי של טלמטריה כשאין פקודות נכנסות (uplink שותק). כשעברו יותר
 // מ-UPLINK_SILENCE_MS בלי פקודה, הסירה משדרת בעצמה כל TELEMETRY_FALLBACK_MS
 // כדי שהמכם ימשיך לשדר זווית+מרחק גם ללא תקשורת נכנסת.
-const unsigned long UPLINK_SILENCE_MS = 300;
-const unsigned long TELEMETRY_FALLBACK_MS = 150;
+// הועלה מ-300 ל-550ms: ה-heartbeat בשרת הוא כעת 400ms, כך שבמהלך קשר תקין
+// הסף לא נחצה והשידור-גיבוי לא מתנגש עם הפקודה הבאה — הוא נכנס רק בניתוק אמיתי.
+const unsigned long UPLINK_SILENCE_MS = 550;
+// קריטי ב-2000bps: פריים טלמטריה = ~150ms אוויר. אם משדרים גיבוי כל 150ms
+// הסירה משדרת ברציפות ומקלטה חירש (חצי-דופלקס) => לעולם לא תופסת פקודה נכנסת
+// => דדלוק. הועלה ל-500ms: הסירה משדרת ~150ms ואז מאזינה ~350ms ותופסת את
+// ה-heartbeat (400ms) של החוף, נכנסת ל-"פינג-פונג" והגיבוי מפסיק מעצמו.
+const unsigned long TELEMETRY_FALLBACK_MS = 500;
 
 void controlMotor(int in1, int in2, int pwmPin, int speed);
 void readAllUltrasonic(int results[4]);
 void showPixel(uint8_t r, uint8_t g, uint8_t b);
-void showProximity(int nearestCm);
+void showModeColor(int mode);
 void slewRadarServoTo(int target);
 
 void setup() {
@@ -144,6 +172,7 @@ void loop() {
     memcpy(&cmd, buf, sizeof(CommandPacket));
     lastCommandMs = now;
     motorsStopped = false;
+    linkLost = false;
 
     driver.send((uint8_t*)&telemetry, sizeof(TelemetryPacket));
     driver.waitPacketSent();
@@ -155,6 +184,14 @@ void loop() {
     // סרוו הרשת: ממפה מהירות -255..255 לזווית 0..180
     int netAngle = map(constrain(cmd.winchSpeed, -255, 255), -255, 255, 0, 180);
     netServo.write(netAngle);
+
+    // חיווי מצב על הטבעת: צבע לפי המצב (ידני/אוטומטי) שנשלח מהחוף.
+    // קוראים ל-pixel.show() (שמכבה פסיקות ~240µs) רק כשהמצב משתנה בפועל
+    // — אירוע נדיר — כך שהוא לעולם לא נופל בזמן קליטת פקודות ולא תוקע את המנועים.
+    if (cmd.mode != lastMode) {
+      lastMode = cmd.mode;
+      showModeColor(cmd.mode);
+    }
   }
 
   // 2) סריקת מכם אוטונומית מקומית — רצה תמיד לפי טיימר, גם ללא פקודות כלל.
@@ -185,12 +222,10 @@ void loop() {
     telemetry.usRight = usResults[3];
     telemetry.radarAngle = nextAngle;
 
-    // חיווי לד קרבה: ירוק כשאין גוף קרוב מ-35ס"מ, ומאדים ככל שהגוף קרוב יותר.
-    int nearest = 999;
-    for (byte i = 0; i < 4; i++) {
-      if (usResults[i] < nearest) nearest = usResults[i];
-    }
-    showProximity(nearest);
+    // הערה: אין כאן רענון של הטבעת. pixel.show() מכבה פסיקות ~240µs (8 לדים)
+    // ואם ירוץ בתזמון אקראי (כל ~90ms) הוא משבש את דגימת ה-RF (טיימר) ומשמיד
+    // פאקטות נכנסות → failsafe עוצר מנועים. לכן מעדכנים את הטבעת רק בחלון הבטוח:
+    // מיד אחרי קבלת פקודה ושידור טלמטריה (בבלוק 1), כשהחוף מאזין ולא משדר אלינו.
   }
 
   // 3) שידור-גיבוי עצמאי: כשקו הפקודות (חוף→סירה) שותק אין "פינג-פונג", ולכן
@@ -210,7 +245,9 @@ void loop() {
     controlMotor(MOTOR1_IN1, MOTOR1_IN2, MOTOR1_PWM, 0);
     controlMotor(MOTOR2_IN1, MOTOR2_IN2, MOTOR2_PWM, 0);
     netServo.write(NET_SERVO_NEUTRAL);
+    linkLost = true;
     showPixel(60, 0, 0); // אדום = אבד קשר (failsafe)
+    lastMode = -1;       // בהתאוששות הקשר — לצייר מחדש את צבע המצב
     cmd.leftSpeed = 0;
     cmd.rightSpeed = 0;
     cmd.winchSpeed = 0;
@@ -256,6 +293,7 @@ void readAllUltrasonic(int results[4]) {
   unsigned long start = micros();
   while (micros() - start < US_TIMEOUT_US) {
     unsigned long now = micros();
+    bool allDone = true;
     for (byte i = 0; i < 4; i++) {
       if (done[i]) continue;
       if (digitalRead(echoPins[i])) {
@@ -266,7 +304,11 @@ void readAllUltrasonic(int results[4]) {
           done[i] = true;
         }
       }
+      if (!done[i]) allDone = false;
     }
+    // יציאה מוקדמת: אם כל 4 החיישנים כבר החזירו הד, אין טעם להמתין עד ה-timeout.
+    // כך משחררים את הלולאה מהר וחוזרים לקלוט RF במקום להיחסם 24ms קבועים.
+    if (allDone) break;
   }
 
   for (byte i = 0; i < 4; i++) {
@@ -297,18 +339,20 @@ void controlMotor(int in1, int in2, int pwmPin, int speed) {
   }
 }
 
-// חיווי לד ניאו-פיקסל יחיד (RGB 0..255, מוגבל ע"י setBrightness).
+// חיווי על כל לדי הטבעת באותו צבע (RGB 0..255, מוגבל על-ידי setBrightness).
 void showPixel(uint8_t r, uint8_t g, uint8_t b) {
-  pixel.setPixelColor(0, pixel.Color(r, g, b));
+  for (int i = 0; i < PIXEL_COUNT; i++) {
+    pixel.setPixelColor(i, pixel.Color(r, g, b));
+  }
   pixel.show();
 }
 
-// חיווי קרבה: ירוק כשהגוף הקרוב ביותר >=35ס"מ, מעבר לינארי לאדום ככל שמתקרב.
-void showProximity(int nearestCm) {
-  const int NEAR_CM = 35;  // מעל זה = ירוק מלא (אין גוף קרוב)
-  const int CLOSE_CM = 5;  // מתחת זה = אדום מלא
-  int d = constrain(nearestCm, CLOSE_CM, NEAR_CM);
-  int green = (long)(d - CLOSE_CM) * 60 / (NEAR_CM - CLOSE_CM);
-  int red = 60 - green;
-  showPixel((uint8_t)red, (uint8_t)green, 0);
+// חיווי מצב על הטבעת: צבע אחיד לכל הלדים לפי המצב שנשלח מהחוף.
+// mode==1 (אוטומטי) → כחול; אחרת (ידני) → ירוק. נקרא רק בעת שינוי מצב.
+void showModeColor(int mode) {
+  if (mode == 1) {
+    showPixel(0, 0, 255);   // אוטומטי = כחול
+  } else {
+    showPixel(0, 255, 0);   // ידני = ירוק
+  }
 }

@@ -47,10 +47,15 @@ def navlog_append(records: list, reset: bool = False) -> str:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         return _navlog_file.name
 
+
 # How often the server re-sends the last command over serial while connected.
-# Must be shorter than the Arduino's FAILSAFE_TIMEOUT_MS (800ms) so that a
+# Must be shorter than the Arduino's FAILSAFE_TIMEOUT_MS (1500ms) so that a
 # stationary boat under active control is never mistaken for a lost link.
-HEARTBEAT_INTERVAL_S = 0.25
+# Raised 0.25 -> 0.40s: at 2000bps a full command+telemetry round-trip takes
+# ~300ms on air. A 250ms heartbeat sent the next command before the boat's
+# reply finished -> half-duplex collision -> both frames lost (observed: ~0.5
+# telemetry/s at close range). 400ms comfortably fits the round-trip.
+HEARTBEAT_INTERVAL_S = 0.40
 
 # --- Real-world link resilience --------------------------------------------
 # Telemetry is considered STALE if no fresh frame arrived within this window.
@@ -89,6 +94,15 @@ def clamp(value: int, low: int, high: int) -> int:
 MOTOR_DEADZONE = 35        # below this magnitude -> 0 (off)
 MOTOR_LOW_SPEED = 70       # bottom of the usable band
 MOTOR_HIGH_SPEED = 100     # top of the usable band
+# Absolute output speed (magnitude) each PHYSICAL drive motor runs at whenever
+# it is driving. The shaped command still decides OFF (0) vs on and the
+# direction (sign); this only overrides the magnitude, so the operator can tune
+# each motor's absolute speed live from the UI to balance a weaker motor without
+# reflashing the boat (applied host-side in build_serial_line; the logical
+# CommandState is unchanged). Defaults preserve the previous calibration: the
+# left motor ran ~90 and the right ~80. Clamped to [0, MOTOR_HIGH_SPEED].
+MOTOR_LEFT_ABS_DEFAULT = 90
+MOTOR_RIGHT_ABS_DEFAULT = 80
 
 # Ultrasonic readings closer than this are treated as spurious (echo ring-down,
 # hull reflections, sensor cross-talk) and are discarded — mapped to the
@@ -137,7 +151,11 @@ def shape_motor_speed(value: int) -> int:
     return stepped if value > 0 else -stepped
 
 
-def build_serial_line(command: "CommandState") -> str:
+def build_serial_line(
+    command: "CommandState",
+    motor_left_abs: int = MOTOR_LEFT_ABS_DEFAULT,
+    motor_right_abs: int = MOTOR_RIGHT_ABS_DEFAULT,
+) -> str:
     """Build the outgoing serial packet, applying hardware wiring corrections.
 
     These fixes live here (host side) so the boat firmware never needs
@@ -147,18 +165,27 @@ def build_serial_line(command: "CommandState") -> str:
       physical wiring (left/right were reversed on the hardware).
     - The net winch motor is wired with reversed polarity, so its speed is
       inverted.
-    The drive motor speeds are also shaped via shape_motor_speed() so each
-    wheel is either off (0) or within the usable [70, 100] band.
+    The drive motor speeds are shaped via shape_motor_speed() so each wheel is
+    either off (0) or driving, then each driving motor's magnitude is set to its
+    operator-tuned absolute speed (motor_left_abs / motor_right_abs).
     The logical CommandState kept in the bridge state stays unchanged, so the
     UI and mock trajectory still see left/right/winch in their intended sense.
     """
     # Swap channels: logical left -> physical right slot, logical right -> left.
     physicalLeft = shape_motor_speed(command.rightSpeed)
     physicalRight = shape_motor_speed(command.leftSpeed)
+    # Override each driving motor's magnitude with its operator-set absolute
+    # speed. An already-off motor (0) stays off; the sign/direction is preserved.
+    if physicalLeft != 0:
+        mag = clamp(int(motor_left_abs), 0, MOTOR_HIGH_SPEED)
+        physicalLeft = mag if physicalLeft > 0 else -mag
+    if physicalRight != 0:
+        mag = clamp(int(motor_right_abs), 0, MOTOR_HIGH_SPEED)
+        physicalRight = mag if physicalRight > 0 else -mag
     physicalWinch = -command.winchSpeed
     return (
         f"{physicalLeft},{physicalRight},"
-        f"{physicalWinch},{command.radarAngle}\n"
+        f"{physicalWinch},{command.radarAngle},{command.mode}\n"
     )
 
 
@@ -180,6 +207,7 @@ class CommandState:
     rightSpeed: int = 0
     winchSpeed: int = 0
     radarAngle: int = 90
+    mode: int = 0  # 0 = ידני (ירוק), 1 = אוטומטי (כחול) — צבע טבעת הלדים בסירה
 
 
 @dataclass
@@ -191,6 +219,8 @@ class BridgeState:
     lastError: str = ""
     lastMessageAt: float | None = None
     stale: bool = False
+    motorLeftAbs: int = MOTOR_LEFT_ABS_DEFAULT
+    motorRightAbs: int = MOTOR_RIGHT_ABS_DEFAULT
     telemetry: Telemetry = field(default_factory=Telemetry)
     command: CommandState = field(default_factory=CommandState)
 
@@ -423,9 +453,12 @@ class SerialBridge:
                 rightSpeed=clamp(int(payload.get("rightSpeed", 0)), -255, 255),
                 winchSpeed=clamp(int(payload.get("winchSpeed", 0)), -255, 255),
                 radarAngle=clamp(int(payload.get("radarAngle", 90)), 0, 180),
+                mode=clamp(int(payload.get("mode", self._state.command.mode)), 0, 1),
             )
 
-            line = build_serial_line(command)
+            line = build_serial_line(
+                command, self._state.motorLeftAbs, self._state.motorRightAbs
+            )
             now = time.time()
             if self._serial is not None and self._serial.is_open:
                 # Rate-limit PHYSICAL writes: a flood of UI commands can saturate
@@ -437,6 +470,25 @@ class SerialBridge:
                     self._last_serial_write_ts = now
             self._state.command = command
             self._state.lastError = ""
+            self._publish()
+            return self.snapshot()
+
+    def set_motor_config(self, payload: dict[str, Any]) -> BridgeState:
+        """Update the per-motor absolute output speeds from the UI.
+
+        Only the keys present in the payload are changed, each clamped to the
+        [0, MOTOR_HIGH_SPEED] range. Applied to every subsequent serial packet
+        (send_command + heartbeat) with no boat reflash.
+        """
+        with self._lock:
+            if payload.get("motorLeftAbs") is not None:
+                self._state.motorLeftAbs = clamp(
+                    int(payload["motorLeftAbs"]), 0, MOTOR_HIGH_SPEED
+                )
+            if payload.get("motorRightAbs") is not None:
+                self._state.motorRightAbs = clamp(
+                    int(payload["motorRightAbs"]), 0, MOTOR_HIGH_SPEED
+                )
             self._publish()
             return self.snapshot()
 
@@ -456,6 +508,8 @@ class SerialBridge:
                 lastError=self._state.lastError,
                 lastMessageAt=self._state.lastMessageAt,
                 stale=is_stale,
+                motorLeftAbs=self._state.motorLeftAbs,
+                motorRightAbs=self._state.motorRightAbs,
                 telemetry=Telemetry(**asdict(self._state.telemetry)),
                 command=CommandState(**asdict(self._state.command)),
             )
@@ -565,9 +619,12 @@ class SerialBridge:
                     command = CommandState(
                         leftSpeed=0, rightSpeed=0, winchSpeed=command.winchSpeed,
                         radarAngle=IDLE_SWEEP_ANGLES[self._idle_sweep_i],
+                        mode=command.mode,
                     )
                     self._state.command = command
-                line = build_serial_line(command)
+                line = build_serial_line(
+                    command, self._state.motorLeftAbs, self._state.motorRightAbs
+                )
                 try:
                     ser.write(line.encode("ascii"))
                     self._last_serial_write_ts = time.time()
@@ -947,6 +1004,10 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
 
             if self.path == "/api/command":
                 self._send_json({"state": asdict(BRIDGE.send_command(body))})
+                return
+
+            if self.path == "/api/motorconfig":
+                self._send_json({"state": asdict(BRIDGE.set_motor_config(body))})
                 return
 
             if self.path == "/api/navlog":

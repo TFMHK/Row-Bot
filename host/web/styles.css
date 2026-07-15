@@ -295,6 +295,39 @@ button:disabled {
   margin: 0 0 10px;
 }
 
+.motor-speed-card {
+  margin-top: 14px;
+}
+
+.motor-speed-hint {
+  margin: 0 0 10px;
+  font-size: 0.85rem;
+  color: var(--text-soft);
+}
+
+.motor-speed-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.motor-speed-row label {
+  color: var(--text-soft);
+}
+
+.motor-speed-row input[type="number"] {
+  width: 90px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--text);
+  font-size: 1rem;
+  text-align: center;
+}
+
 .joystick-base {
   width: min(260px, 100%);
   aspect-ratio: 1;

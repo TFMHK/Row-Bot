@@ -29,6 +29,8 @@ const mapCanvas = document.getElementById("mapCanvas");
 const mapCtx = mapCanvas.getContext("2d");
 const mapPointsValue = document.getElementById("mapPointsValue");
 const mapClearBtn = document.getElementById("mapClearBtn");
+const motorLeftAbsInput = document.getElementById("motorLeftAbs");
+const motorRightAbsInput = document.getElementById("motorRightAbs");
 // The mock world picture and the accumulated radar map are meaningful ONLY in
 // mock mode (both rely on the simulator's dead-reckoned world pose). On a real
 // boat they show stale/garbage, so the whole panels are hidden off-mock.
@@ -79,6 +81,7 @@ const state = {
     // --- פולסי-סיבוב קצרים (סיבוב במקום בציר 0, לא קשתות) ---
     spinUntil: 0,          // חותמת-זמן: עד מתי הפולס הנוכחי מסובב במקום
     settleUntil: 0,        // חותמת-זמן: עד מתי מיישרים/עוצרים בין פולסים
+    reverseUntil: 0,       // חותמת-זמן: עד מתי נמשך פרץ-הנסיעה-לאחור המחויב
   },
   telemetry: {
     usRadar: null,
@@ -248,6 +251,47 @@ const RADAR_STEP_EVERY_TICKS = 1;
 // so moved/phantom returns don't linger as stale rings while every bearing is
 // still refreshed at least once before it dies.
 const RADAR_TTL_MS = 3000;
+// חלון התמדה לתצוגה בלבד. על החומרה האמיתית הסריקה המסתובבת (רבע-סריקה 0..90°, 4
+// חיישנים 90° זה מזה) חוזרת לאותו כיוון רק כל ~5 שניות, ועוד יותר בזמן תקיעות RF.
+// אם מוחקים בליפ/קיר אחרי RADAR_TTL_MS(3s) הם פגים לפני שהסריקה חוזרת לרענן אותם —
+// ולכן התמונה "מנצנצת": נקודות/קווים נעלמים וחוזרים כל הזמן. לצג נחזיק כל בליפ עד
+// חלון של סריקה מלאה + שיהוי-קישור, כדי שהתמונה תישאר רציפה. זה משפיע רק על מה
+// שמצויר; הניווט האוטונומי ממשיך לקרוא רק נתונים טריים (RADAR_TTL_MS / liveScan).
+// מדידה על הלוגים האמיתיים (nav-*.ndjson): קצב פריימים טריים מהסירה = ~0.9–3.5
+// לשנייה עם פערים עד ~8 שניות (תקיעות RF). כל פריים מקדם את הסרבו ב-15° בלבד,
+// אז סריקה מלאה (0..90..0, ~14 צעדים) לוקחת ~5–14 שניות. לכן חלון התצוגה חייב
+// לכסות סריקה מלאה כדי שהתמונה לא תנצנץ (6s היה קצר מדי לקצב הנמדד).
+const RADAR_DISPLAY_TTL_MS = 12000;
+// חלון איסוף נקודות להתאמת קו-קיר (נפרד מחלון הנקודות לתצוגה): מספיק ארוך כדי
+// לאסוף >=3 נקודות על הסריקה האיטית, אבל לא ארוך מדי כדי שנקודות מפוזרות על פני
+// תנועת הסירה (דד-רקונינג גס) ימרחו את הקו. הקטע שהותאם נשמר אח"כ WALL_TTL_MS.
+const RADAR_WALL_FIT_TTL_MS = 6000;
+// כשמאבדים תקשורת (לא מגיע פריים טלמטריה חדש) חייבים להמשיך לראות את תמונת המכ"ם
+// האחרונה במקום שהיא תדעך לריק. ה-TTL נועד לפוג בלימים שלא רועננו בזמן שהסריקה
+// *ממשיכה* — אבל אם הסריקה עצמה נעצרה (אין תקשורת), אין מה שיחליף אותם, אז מקפיאים
+// את שעון-ההזדקנות של הצג. אחרי פרק זמן זה ללא פריים טרי, ה-radarClock קופא, כך
+// שהקירות והנקודות האחרונים נשארים על המסך; כשהתקשורת חוזרת ההזדקנות ממשיכה
+// והבלימים שלא רועננו פגים כרגיל. הערך קטן מ-RADAR_DISPLAY_TTL_MS כך שאף בליפ לא נמחק לפני הקיפאון.
+const RADAR_FREEZE_AFTER_MS = 1500;
+
+// --- אינטרפולציה ליניארית פר-צד --------------------------------------------------
+// האולטרה-סוניק גס: קיר ישר יוצא כנקודות מפוזרות/קו עקום. כל חיישן (חזית/ימין/
+// אחור/שמאל) סורק קשת ~75° משלו, ולכן מעבדים כל צד בנפרד: מתאימים קו ישר יחיד
+// לנקודות החיות של אותו צד (רגרסיה אורתוגונלית — עובד גם לקיר "אנכי"), ומציירים
+// אותו כקטע רציף על הצג + מזינים את הטווח המתוקן לניווט. כך גם כשהסריקה האיטית
+// של החומרה מדלגת על סלוט בודד, מוצג קו מלא ורציף במקום נקודות מנצנצות.
+const RADAR_FIT_MIN_POINTS = 3;          // צריך לפחות 3 נקודות כדי להצדיק קו
+const RADAR_FIT_MAX_RESIDUAL_CM = 25;    // אם הפיזור סביב הקו גדול מזה — לא קיר, לא מציירים
+const WALL_TTL_MS = 10000;               // קטע-קיר מיושר נשמר עד שהסריקה האיטית תחזור לרעננו, כדי שלא ינצנץ
+// המכ"ם סורק 0..90° ומגלגל את כל 4 החיישנים יחד. אמצע-הסריקה (45°) מיושר עם החרטום,
+// ולכן בצג מסובבים את התמונה ב-SWEEP_CENTER_DEG כדי שהחיישן הקדמי (הירוק) יהיה
+// למעלה ויסרוק ימינה-שמאלה סימטרית סביב החרטום, ושאר החיישנים בהתאמה.
+const SWEEP_CENTER_DEG = 45;
+// קו-קיר אמיתי סטטי בעולם, ולכן נקודות-הקצה שלו בקואורדינטות עולם כמעט לא זזות בין
+// פריים לפריים — הקפיצות הן רעש-פיטינג. מחליקים את הקצוות ב-EMA (חלק מהמדידה החדשה
+// בכל פריים) כדי שהקו יזוז חלק ורציף במקום לקפוץ. זה גם מייצב את הטווח שהניווט קורא
+// (שנגזר מאותו קו), ולכן משפר גם את האוטונומי. ערך נמוך = חלק יותר אך איטי יותר.
+const RADAR_WALL_SMOOTH = 0.25;
 
 // --- סינון חציון לרעש חיישנים (חומרה מחזירה שגיאות מדידה) --------------------
 // חומרה אמיתית זורקת מדי פעם קריאה שגויה: dropout (999) או קפיצת-רפאים קצרה,
@@ -335,6 +379,8 @@ modeSwitch.addEventListener("change", onModeChange);
 refreshPortsBtn.addEventListener("click", refreshPorts);
 mockSwitch.addEventListener("change", onMockToggle);
 mapClearBtn.addEventListener("click", clearRadarMap);
+motorLeftAbsInput.addEventListener("change", () => sendMotorConfig("motorLeftAbs", motorLeftAbsInput));
+motorRightAbsInput.addEventListener("change", () => sendMotorConfig("motorRightAbs", motorRightAbsInput));
 
 setupJoystick();
 setupWinchJoystick();
@@ -383,6 +429,33 @@ async function onMockToggle() {
   } catch (err) {
     mockSwitch.checked = !mockSwitch.checked;
     setServerMessage(`החלפת מצב מוק נכשלה: ${err.message}`, true);
+  }
+}
+
+// Push one motor's absolute output speed (0-100) to the server. The value is
+// clamped client-side too so a stray/empty box can't send garbage; the server
+// applies it to every subsequent serial packet (no boat reflash).
+async function sendMotorConfig(key, input) {
+  let value = Math.round(Number(input.value));
+  if (!Number.isFinite(value)) return;
+  value = Math.max(0, Math.min(100, value));
+  input.value = String(value);
+  try {
+    const response = await postJson("/api/motorconfig", { [key]: value });
+    applyRemoteState(response.state);
+  } catch (err) {
+    setServerMessage(`עדכון מהירות מנוע נכשל: ${err.message}`, true);
+  }
+}
+
+// Reflect the server's per-motor absolute speeds in the text boxes, but never
+// overwrite a box the operator is actively editing (focused).
+function updateMotorConfigUI(remoteState) {
+  if (document.activeElement !== motorLeftAbsInput && remoteState.motorLeftAbs != null) {
+    motorLeftAbsInput.value = String(remoteState.motorLeftAbs);
+  }
+  if (document.activeElement !== motorRightAbsInput && remoteState.motorRightAbs != null) {
+    motorRightAbsInput.value = String(remoteState.motorRightAbs);
   }
 }
 
@@ -476,6 +549,9 @@ function startCommandLoop() {
     // הדריסה מחושבת על עותק בלבד, כך שברגע שיוצאים מהטווח הכתום
     // השליטה חוזרת מיד לניווט האוטונומי/השליטה הידנית.
     const outgoing = computeSafeCommand();
+    // מצב ההפעלה (0=ידני, 1=אוטומטי) נשלח עם כל פקודה; הסירה מציגה צבע לפיו
+    // ומעדכנת את הלד רק כשהערך משתנה (כך לא משבשים את קליטת ה-RF).
+    outgoing.mode = state.manualMode ? 0 : 1;
 
     // Record the full I/O + decision of this autonomous tick for later analysis.
     if (!state.manualMode) recordNavTick(outgoing);
@@ -494,8 +570,7 @@ function startCommandLoop() {
       setServerMessage(`שליחת פקודה נכשלה: ${err.message}`, true);
     } finally {
       state.sendingCommand = false;
-    }
-  }, CONTROL_INTERVAL_MS);
+    }  }, CONTROL_INTERVAL_MS);
 }
 
 function stopCommandLoop() {
@@ -715,8 +790,16 @@ function applyRemoteState(remoteState, syncCmd = false) {
     updateRadarMemory();
     accumulateRadarMap();
     updateLiveScan();
+    // חשוב לסדר: קודם updateLiveScan ממלא את liveScan מהקריאות הגלמיות, ורק אז
+    // updateRadarWalls דורס את הבינים שנפלו על קו-קיר בטווח המיושר. כך הניווט
+    // האוטונומי (liveCone) באמת מסתמך על האינטרפולציה, לא רק הצג.
+    updateRadarWalls();
   } else {
-    radarMemory.clear();
+    // Comms lost / not connected: keep the LAST radar picture (radarMemory +
+    // radarWalls) on screen instead of wiping it, so the operator still sees
+    // what was there before. radarClock freezes its ageing so it won't fade.
+    // Only the nav-facing liveScan is cleared, so autonomy never acts on frozen
+    // data as if it were a live, confirmed reading.
     liveScan.clear();
   }
 
@@ -725,6 +808,7 @@ function applyRemoteState(remoteState, syncCmd = false) {
   updateTelemetryUI();
   updateCommandUI();
   setConnectedUI(state.connected, state.serialPort);
+  updateMotorConfigUI(remoteState);
 
   mockSwitch.checked = state.mockEnabled;
   portSelect.disabled = state.mockEnabled || state.connected;
@@ -799,6 +883,7 @@ function onModeChange() {
       state.nav.calibStart = performance.now();
       state.nav.spinUntil = 0;
       state.nav.settleUntil = 0;
+      state.nav.reverseUntil = 0;
       // Coarse travel direction: heading 0 = "the way the bow points now", which
       // the operator aims at the goal/channel entrance before arming autonomy.
       state.pose.x = 0;
@@ -810,6 +895,10 @@ function onModeChange() {
       rawPrev.clear();
       bowEstSin = 0;
       bowEstCos = 0;
+      bowEstWeight = 0;
+      bowCandidateDeg = null;
+      bowStableHits = 0;
+      resetRadarWalls();
     }
     // Begin a fresh run recording (new log file) whenever autonomy arms.
     startNavLogSession();
@@ -948,8 +1037,8 @@ function setupWinchJoystick() {
 function advanceRadarSweep() {
   const step = 15;
   let next = state.cmd.radarAngle + step * state.radarSweepDir;
-  if (next >= 75) {
-    next = 75;
+  if (next >= 90) {
+    next = 90;
     state.radarSweepDir = -1;
   } else if (next <= 0) {
     next = 0;
@@ -1322,19 +1411,28 @@ function updateEscapeManeuver() {
 // learned online, during motion, every trip (see the estimator in
 // updateLiveScan) and stored in state.nav.bowOffsetDeg.
 const BOW_SERVO_OFFSET_DEG = 60;
-const LIVE_SCAN_TTL_MS = 2200;   // a bearing bin is trusted only if refreshed this recently
+// The radar array is a ROTATING quarter-sweep (servo 0..90 in 15 deg steps, one
+// step per telemetry frame ~350ms), so any given bow-relative bearing is only
+// re-sampled about once every ~6 steps ~ 2-3s (worse when the RF link stalls).
+// If the TTL is shorter than that the BOW bin goes stale mid-sweep, liveCone
+// returns count 0 => front reads 999 ("open") => the nav cruises straight into a
+// wall it had ALREADY seen on an earlier sweep. Trust a bin for a full sweep +
+// link jitter (matches the wall-display WALL_TTL_MS 4000). The boat is slow
+// (~16 cm/s) so a 4 s-old bearing is still spatially valid enough to avoid.
+const LIVE_SCAN_TTL_MS = 4000;   // a bearing bin is trusted only if refreshed this recently
 const LIVE_BIN_DEG = 15;         // bin width ~ sensor field of view
 const RW_CRUISE = 82;            // gentle forward (real momentum + noise tolerance)
-const RW_TURN = 85;              // pivot-in-place magnitude
-const RW_REVERSE = 80;           // backing-out magnitude when boxed in
+const RW_REVERSE = 80;           // backing-out magnitude when blocked / boxed in
 const RW_FRONT_CONE_DEG = 22;    // half-cone treated as "dead ahead"
 const RW_SIDE_BEARING_DEG = 55;  // bearing where we probe for the escape side
 const RW_SIDE_TOL_DEG = 40;
-const RW_BLOCK_CM = 45;          // front closer than this -> commit to a pivot
-const RW_CLEAR_CM = 85;          // front clear beyond this -> release the pivot (hysteresis)
-const RW_EMERGENCY_CM = 24;      // hard stop / pivot regardless of intent
-const RW_STEER_LIMIT = 26;       // max differential added to cruise while seeking
+const RW_BLOCK_CM = 45;          // front closer than this -> back off (reverse burst)
+const RW_EMERGENCY_CM = 24;      // hard stop -> reverse away, regardless of intent
 const RW_ARC_DEG = 70;           // forward hemisphere scanned for a gap to steer into
+// Turning is never the default: within this heading error the boat drives dead
+// straight; only a gap notably off to a side eases the inner motor into a
+// forward ARC (turn WHILE advancing), so it only ever turns in order to travel.
+const RW_ARC_DEADBAND_DEG = 20;
 const RW_SIDE_TIE_CM = 15;       // |left-right| below this is a tie -> break toward goal
 // --- Wave/wind robustness (self-refining, no hardcoded environment size) ---
 const RW_MAX_RANGE = 300;        // "no echo" (open water) is stored as this range
@@ -1355,6 +1453,28 @@ const RW_CLOSE_RATE_MIN = 5;     // cm/s: min closing rate for a bearing to vote
 const RW_CLOSE_RATE_CAP = 60;    // cm/s: clamp a single vote's weight
 const BOW_EST_DECAY = 0.9;       // per-update memory of the circular accumulator
 const BOW_EST_MIN_CONF = 50;     // accumulator magnitude required before adopting the estimate
+// The accumulator magnitude ALONE always grows past BOW_EST_MIN_CONF given enough
+// votes (geometric sum of the decay), even from a flat/ambiguous distribution — so
+// magnitude by itself will happily "lock" onto noise. In a small enclosed pool the
+// walls close in from EVERY side while driving, so the closing-rate votes are near
+// uniform (verified on real logs: mean resultant length ~0.1-0.3 for the runs with
+// enough samples). Adopt the online bow ONLY when the votes genuinely AGREE on a
+// direction: require the mean resultant length (|resultant| / accumulated weight)
+// to clear this consensus floor AND a minimum accumulated weight. Otherwise keep
+// the calibrated seed offset (stable, slightly-off bow beats a randomly-rotating
+// world-view every trip). An open course with a real dominant bow signal can still
+// clear it; a walled pool correctly won't, and falls back to the seed.
+const BOW_EST_MIN_CONSENSUS = 0.6;  // mean resultant length required to trust the estimate
+const BOW_EST_MIN_WEIGHT = 200;     // min accumulated (decayed) vote weight before adopting
+// Even a genuine consensus can appear for a moment from a lucky burst of aligned
+// votes. A FIXED hardware bow does not wander, so also demand TEMPORAL STABILITY:
+// the instantaneous estimate must stay within a tight tolerance for several
+// consecutive qualifying updates before we adopt it. A transient burst resets the
+// streak, so only a bow that is simultaneously well-supported, agreed-upon, AND
+// steady over time is trusted — exactly what a real fixed bow looks like and what
+// pool noise cannot fake.
+const BOW_EST_STABLE_DEG = 18;      // max wander of the estimate to count as "steady"
+const BOW_EST_STABLE_HITS = 8;      // consecutive steady qualifying updates to lock
 
 // bowRel bin (integer, -180..180 step LIVE_BIN_DEG) -> { dist, t }
 const liveScan = new Map();
@@ -1363,6 +1483,14 @@ const liveScan = new Map();
 const rawPrev = new Map();
 let bowEstSin = 0;
 let bowEstCos = 0;
+// Decaying SUM of vote weights (same BOW_EST_DECAY), so |resultant|/bowEstWeight is
+// the mean resultant length (vote consensus in 0..1). Distinguishes "many votes
+// agreeing" (real bow) from "many votes cancelling out" (pool noise).
+let bowEstWeight = 0;
+// Temporal-stability tracker for the bow lock: the last accepted candidate angle
+// and how many consecutive qualifying updates have agreed with it.
+let bowCandidateDeg = null;
+let bowStableHits = 0;
 
 function wrap180(deg) {
   return (((deg % 360) + 540) % 360) - 180;
@@ -1416,16 +1544,46 @@ function updateLiveScan() {
           const rad = degToRad(rawBearing);
           bowEstSin = BOW_EST_DECAY * bowEstSin + w * Math.sin(rad);
           bowEstCos = BOW_EST_DECAY * bowEstCos + w * Math.cos(rad);
+          bowEstWeight = BOW_EST_DECAY * bowEstWeight + w;
         }
       }
     }
   }
-  // Adopt the running estimate once it is confident enough.
-  if (Math.hypot(bowEstSin, bowEstCos) >= BOW_EST_MIN_CONF) {
-    state.nav.bowOffsetDeg = normalizeDeg(
-      (Math.atan2(bowEstSin, bowEstCos) * 180) / Math.PI
-    );
-    state.nav.bowLocked = true;
+  // Adopt the running estimate ONLY when the votes both accumulate enough evidence
+  // AND genuinely agree on a direction (mean resultant length). Magnitude alone
+  // would lock onto the flat closing-rate distribution of a walled pool; the
+  // consensus test rejects that and keeps the calibrated seed offset instead.
+  const resultant = Math.hypot(bowEstSin, bowEstCos);
+  const consensus = bowEstWeight > 1e-6 ? resultant / bowEstWeight : 0;
+  if (
+    resultant >= BOW_EST_MIN_CONF &&
+    bowEstWeight >= BOW_EST_MIN_WEIGHT &&
+    consensus >= BOW_EST_MIN_CONSENSUS
+  ) {
+    const estDeg = normalizeDeg((Math.atan2(bowEstSin, bowEstCos) * 180) / Math.PI);
+    // Temporal stability: the estimate must persist near the same angle for
+    // several consecutive qualifying updates before it is trusted.
+    if (
+      bowCandidateDeg != null &&
+      Math.abs(wrap180(estDeg - bowCandidateDeg)) <= BOW_EST_STABLE_DEG
+    ) {
+      bowStableHits++;
+    } else {
+      bowStableHits = 1;
+    }
+    // Track a slowly-updated candidate (light smoothing keeps it centred).
+    bowCandidateDeg =
+      bowCandidateDeg == null
+        ? estDeg
+        : normalizeDeg(bowCandidateDeg + wrap180(estDeg - bowCandidateDeg) * 0.3);
+    if (bowStableHits >= BOW_EST_STABLE_HITS) {
+      state.nav.bowOffsetDeg = bowCandidateDeg;
+      state.nav.bowLocked = true;
+    }
+  } else {
+    // Evidence faded below the gate — decay the streak so a later burst must
+    // re-establish stability rather than resume an old count.
+    bowStableHits = Math.max(0, bowStableHits - 1);
   }
 }
 
@@ -1478,45 +1636,33 @@ const RW_WALL_TARGET_CM = 35;     // מרחק המטרה מהדופן השמאל
 const RW_WALL_BAND_CM = 10;       // רוחב היסטרזיס סביב המטרה (± ס"מ)
 const RW_WALL_BEARING_DEG = -90;  // הדופן השמאלית במסגרת-חרטום (שלילי = שמאל)
 const RW_WALL_TOL_DEG = 30;       // סובלנות זוויתית לחרוט הצד השמאלי
-// כל סיבוב הוא סיבוב-במקום בציר 0 (מנועים ±80 מנוגדים), בפולסים קצרים ולא תנועה
-// אחת ארוכה: פולס סיבוב קצר, ואז חלון "יישוב" קצר (נסיעה ישרה או עצירה) שנותן
-// לסריקת המכ"ם להתרענן לפני החלטה נוספת — כך הסירה לא מסתחררת יתר על המידה ולא
-// נסחפת מהכיוון הרצוי.
-const RW_SPIN_PULSE_MS = 350;     // משך פולס-סיבוב יחיד
-const RW_SPIN_SETTLE_MS = 500;    // חלון היישוב בין פולסים
+// נסיעה-לאחור מחויבת כ"פרץ" בעל משך מינימלי, לא נדנוד של טיק בודד. בקצב-קישור
+// איטי ורועש קריאת-החזית מתנדנדת סביב סף הנסיעה-לאחור, וכל טיק שמחליט מחדש
+// לאחור/קדימה גורם לסירה לנוע קדימה-אחורה במקום בלי להתקדם. פרץ מחויב נסוג מרחק
+// אמיתי, ואז ההערכה הבאה מוצאת מקום להסתובב לעבר הפתח ולצאת.
+const RW_REVERSE_BURST_MS = 800;
 
-// מבצע פנייה כרצף פולסי סיבוב-במקום קצרים סביב ציר 0 (±MOTOR_SPEED על מנועים
-// מנוגדים), מופרדים בחלון יישוב. dir>0 = סיבוב ימינה, dir<0 = סיבוב שמאלה.
-// settleStraight=true נוסע ישר קדימה בין פולסים (בטוח כשהחזית פתוחה — תיקוני
-// עקיבת-דופן); false עוצר במקום (כשהחזית חסומה).
-function pulseTurn(dir, settleStraight) {
-  const now = performance.now();
-  const p = state.nav;
-  if (now >= p.spinUntil && now >= p.settleUntil) {
-    // התחלת מחזור פולס חדש
-    p.spinUntil = now + RW_SPIN_PULSE_MS;
-    p.settleUntil = p.spinUntil + RW_SPIN_SETTLE_MS;
-  }
-  if (now < p.spinUntil) {
-    state.cmd.leftSpeed = -dir * MOTOR_SPEED; // סיבוב במקום (ציר 0)
-    state.cmd.rightSpeed = dir * MOTOR_SPEED;
-  } else if (settleStraight) {
-    state.cmd.leftSpeed = MOTOR_SPEED;
-    state.cmd.rightSpeed = MOTOR_SPEED;
-  } else {
-    state.cmd.leftSpeed = 0;
-    state.cmd.rightSpeed = 0;
-  }
+// Reversing ARC used to back off a blocked bow. The motors are 3-state (0/±80),
+// so a symmetric spin (80/-80) has ZERO net translation — it just rotates on
+// the spot, which is exactly what we DON'T want. A single reversed motor both
+// TRAVELS (backward) and swings the bow toward the open side, so the boat only
+// ever turns as part of real motion. Boxed in on both quarters -> straight back
+// out to gain room. (turn = right-left: openDir>0 wants the bow to swing right,
+// which needs turn>0, i.e. left backs while right idles.)
+function reverseArcCmd(openDir, boxed) {
+  if (boxed) return { left: -RW_REVERSE, right: -RW_REVERSE };
+  return openDir > 0
+    ? { left: -RW_REVERSE, right: 0 }
+    : { left: 0, right: -RW_REVERSE };
 }
 
-// Real-world autonomous tick. GUIDING LOGIC: keep 35 cm from the LEFT wall
-// (bang-bang, 3-state motors 80/-80/0). The boat+radar rotate along the course
-// so the wall curves and can appear ahead or astern: a wall straight ahead is
-// an INSIDE corner (turn right, away from the left wall); a receding left wall
-// is an OUTSIDE corner (turn left to re-acquire it). Front-block + boxed-in
-// checks keep the boat from getting stuck against a wall. ALL turns are short
-// in-place spin pulses (axis 0) rather than long arcs, to avoid over-rotation
-// and heading drift.
+// Real-world autonomous tick. GUIDING PRINCIPLE: turning is NOT a magic escape
+// and is never the default. The boat TRAVELS — forward when the bow is clear
+// (steering toward the most open bearing as a forward ARC so it turns while
+// advancing), and backward when the bow is blocked (a committed reverse burst,
+// arced toward the open side). It never performs a net-zero in-place spin; every
+// heading change happens as part of real forward or backward motion. Front-block
+// + boxed-in checks keep it from grinding into a wall.
 function updateAutonomousRealworld() {
   const now = performance.now();
 
@@ -1538,61 +1684,70 @@ function updateAutonomousRealworld() {
   const fc = liveCone(0, RW_FRONT_CONE_DEG);
   const front = fc.median;
 
-  // Committed-pivot hysteresis: once turning to clear the bow, keep pulsing the
-  // in-place spin until the front is genuinely clear (fresh AND beyond
-  // RW_CLEAR_CM) so a stale/dropout reading can't fake a "clear" too early. The
-  // settle window holds still (bow blocked) so it never creeps into the wall.
-  if (state.avoidDir !== 0) {
-    if (fc.count > 0 && front >= RW_CLEAR_CM) {
-      state.avoidDir = 0;
-    } else {
-      pulseTurn(state.avoidDir, false);
-      return;
-    }
+  // --- Committed reverse burst in progress: honor it to completion even once
+  // the front reads clear, so we back off a real distance instead of flipping
+  // straight back to forward (the pointless forward/back jitter). ---
+  if (now < state.nav.reverseUntil) {
+    const leftQ = liveDistance(-RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
+    const rightQ = liveDistance(RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
+    const boxed = leftQ < RW_BLOCK_CM && rightQ < RW_BLOCK_CM;
+    const openDir = rightQ >= leftQ ? 1 : -1;
+    const rc = reverseArcCmd(openDir, boxed);
+    state.avoidDir = 0;
+    state.cmd.leftSpeed = rc.left;
+    state.cmd.rightSpeed = rc.right;
+    return;
   }
 
-  // --- Anti-stuck: something blocking the bow (inside corner or a trap). ---
+  // --- Bow blocked (inside corner or a trap). Turning in place is NOT the
+  // escape: a net-zero spin makes no progress and can grind the hull along the
+  // wall. Instead back off with a COMMITTED reverse burst, arced toward the more
+  // open side so the bow swings toward the opening WHILE actually travelling
+  // backward. Once the front clears, the cruise block resumes forward travel. ---
   if (fc.count > 0 && front < RW_BLOCK_CM) {
     const leftQ = liveDistance(-RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
     const rightQ = liveDistance(RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
-    if (leftQ < RW_BLOCK_CM && rightQ < RW_BLOCK_CM) {
-      // Walled on the bow AND both quarters -> back straight out to break free.
-      state.avoidDir = 0;
-      state.cmd.leftSpeed = -MOTOR_SPEED;
-      state.cmd.rightSpeed = -MOTOR_SPEED;
-      return;
-    }
-    // Inside corner: wall ahead while following the left wall -> spin RIGHT in
-    // place (away from the left wall), committed via avoidDir until it clears.
-    state.avoidDir = 1; // +1 = spin right
-    pulseTurn(1, false);
+    const openDir = rightQ >= leftQ ? 1 : -1; // +1 = more open on the right
+    const boxed = leftQ < RW_BLOCK_CM && rightQ < RW_BLOCK_CM;
+    const rc = reverseArcCmd(openDir, boxed);
+    state.nav.reverseUntil = now + RW_REVERSE_BURST_MS;
+    state.avoidDir = 0;
+    state.cmd.leftSpeed = rc.left;
+    state.cmd.rightSpeed = rc.right;
     return;
   }
 
-  // --- Keep 35 cm from the left wall (bang-bang with a hysteresis band). ---
-  // Turns are short in-place spin pulses about axis 0; between pulses the boat
-  // drives straight (bow is open here) so it still makes forward progress.
-  const wc = liveCone(RW_WALL_BEARING_DEG, RW_WALL_TOL_DEG);
-  if (wc.count === 0) {
-    // No fresh left reading yet -> drive straight, let the servo sweep refresh
-    // that bearing rather than steer blind.
-    state.cmd.leftSpeed = MOTOR_SPEED;
-    state.cmd.rightSpeed = MOTOR_SPEED;
+  // --- No FRESH knowledge straight ahead: the rotating scanner has not
+  // re-swept the bow within LIVE_SCAN_TTL_MS (slow quarter-sweep + RF stalls).
+  // "Unknown ahead" is NOT "open water" — cruising blind is exactly how the boat
+  // drove into a wall it had already seen on an earlier sweep. Hold still (a
+  // safe, in-place wait) until the sweep refreshes the bow, then decide next
+  // tick with real data instead of charging forward. ---
+  if (fc.count === 0) {
+    state.cmd.leftSpeed = 0;
+    state.cmd.rightSpeed = 0;
     return;
   }
-  const wall = wc.median;
 
-  if (wall > RW_WALL_TARGET_CM + RW_WALL_BAND_CM) {
-    // Wall too far / lost (outside corner, course turns left) -> spin LEFT.
-    pulseTurn(-1, true);
-  } else if (wall < RW_WALL_TARGET_CM - RW_WALL_BAND_CM) {
-    // Too close -> spin RIGHT to open the gap back to 35 cm.
-    pulseTurn(1, true);
-  } else {
-    // Within the 35 cm band -> straight ahead (also feeds the bow estimator).
-    state.cmd.leftSpeed = MOTOR_SPEED;
-    state.cmd.rightSpeed = MOTOR_SPEED;
+  // --- Bow is clear: TRAVEL FORWARD toward the most open bearing. Turning is
+  // done as a forward ARC — a gap within RW_ARC_DEADBAND_DEG keeps both motors
+  // forward (dead straight); a gap notably off to a side eases the inner motor
+  // toward 0 so, after the 3-state shaping, one motor drives and the other idles
+  // and the boat turns WHILE advancing. It never spins in place; it only turns
+  // in order to travel. Driving straight also feeds the bow estimator.
+  const openF = bestOpenBearing(-RW_ARC_DEG, RW_ARC_DEG);
+  let left = RW_CRUISE;
+  let right = RW_CRUISE;
+  if (openF.count > 0 && Math.abs(openF.bearing) > RW_ARC_DEADBAND_DEG) {
+    // Ease the inner motor in proportion to the heading error; a large error
+    // drops it below the motor deadzone -> a genuine forward-arc turn.
+    const frac = clamp(Math.abs(openF.bearing) / RW_ARC_DEG, 0, 1);
+    const inner = Math.round(RW_CRUISE * (1 - frac)); // -> 0 at full deflection
+    if (openF.bearing > 0) left = inner; // steer right: ease the left (inner) motor
+    else right = inner; // steer left: ease the right (inner) motor
   }
+  state.cmd.leftSpeed = left;
+  state.cmd.rightSpeed = right;
 }
 
 // Instantaneous-radar safety envelope for the physical boat (no pose, no map).
@@ -1602,15 +1757,19 @@ function realworldSafeCommand(cmd) {
   // Use the fresh-cone MIN here (not the median): the hard stop must react even
   // to a single genuinely-close return, at the cost of an occasional spray stop.
   if (fc.count > 0 && fc.min < RW_EMERGENCY_CM && netForward > 0) {
-    // Something is right on the bow and we are still driving into it: cut the
-    // forward drive and pivot in place toward the more open side. Keep the
-    // navigator committed to the same pivot via state.avoidDir.
+    // Something is right on the bow and we are still driving into it: don't spin
+    // in place — REVERSE away (arced toward the more open side) so we gain real
+    // clearance, and commit a reverse burst so the next ticks keep backing off
+    // instead of lunging forward again.
     const left = liveDistance(-RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
     const right = liveDistance(RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
-    const dir = right >= left ? 1 : -1;
-    state.avoidDir = dir;
-    cmd.leftSpeed = -dir * RW_TURN;
-    cmd.rightSpeed = dir * RW_TURN;
+    const openDir = right >= left ? 1 : -1;
+    const boxed = left < RW_BLOCK_CM && right < RW_BLOCK_CM;
+    const rc = reverseArcCmd(openDir, boxed);
+    state.avoidDir = 0;
+    state.nav.reverseUntil = performance.now() + RW_REVERSE_BURST_MS;
+    cmd.leftSpeed = rc.left;
+    cmd.rightSpeed = rc.right;
   }
   cmd.leftSpeed = shapeMotorSpeed(cmd.leftSpeed);
   cmd.rightSpeed = shapeMotorSpeed(cmd.rightSpeed);
@@ -2430,6 +2589,203 @@ const SENSOR_BEAMS = [
 // rings or arcs that never existed in the world.
 const radarMemory = new Map();
 
+// Wall-clock (performance.now) of the last GENUINE telemetry frame folded into
+// the radar picture. Only updated inside updateRadarMemory, which runs solely
+// when the boat is connected/mock, so a comms dropout stops it advancing.
+let lastRadarFreshAt = 0;
+
+// Display ageing clock. During normal operation it IS performance.now(), so the
+// radar TTLs work exactly as before. When telemetry stops arriving for longer
+// than RADAR_FREEZE_AFTER_MS (comms loss), it freezes at that point so the last
+// picture (walls + blips) stays on screen instead of ageing out to blank; it
+// resumes the moment a fresh frame arrives. This is a DISPLAY concern only — the
+// navigator keeps using real time / liveScan freshness and never acts on frozen
+// data as if it were live.
+function radarClock() {
+  const real = performance.now();
+  if (lastRadarFreshAt && real - lastRadarFreshAt > RADAR_FREEZE_AFTER_MS) {
+    return lastRadarFreshAt + RADAR_FREEZE_AFTER_MS;
+  }
+  return real;
+}
+
+// Fitted wall segments, one per side (0=front,1=right,2=back,3=left sensor
+// sector). Each holds the two endpoints of the straight line fitted to that
+// side's recent points, FROZEN in world coordinates (like radarMemory) plus a
+// timestamp. Recomputed every telemetry frame from the live raw points; drawn as
+// a solid, gap-free line and kept alive for WALL_TTL_MS so it doesn't flicker
+// when a single 15° slot is momentarily missed by the slow real-HW sweep.
+const radarWalls = new Map();
+
+function resetRadarWalls() {
+  radarWalls.clear();
+}
+
+// Per-side linear interpolation. Groups the currently-live raw detections by
+// sensor side (each sensor owns its own ~75° arc), fits ONE straight line per
+// side (orthogonal / total-least-squares, so a wall at any orientation works,
+// including one seen edge-on), rejects sides that aren't actually a straight
+// surface, and publishes:
+//   * a world-space wall SEGMENT (radarWalls) for the display, and
+//   * range corrected onto the line (liveScan bins) for the autonomous nav.
+// It reads radarMemory RAW and never writes back to it, so the fit can't feed on
+// its own previous output (no drift). Called at the end of every updateRadarMemory.
+function updateRadarWalls() {
+  const now = performance.now();
+  const heading = state.pose.headingDeg;
+  const bx = state.pose.x;
+  const by = state.pose.y;
+  const bowOff = state.nav.bowOffsetDeg ?? BOW_SERVO_OFFSET_DEG;
+
+  // Bucket live, valid detections into the 4 sensor sides. slot - heading is
+  // heading-independent (all sensors rotate with the boat), so a side always
+  // collects the same sensor's arc even while turning. Fitting uses a MODERATE
+  // window (RADAR_WALL_FIT_TTL_MS) — long enough for the slow real-HW sweep to
+  // gather >=3 points per side, but short enough that a moving boat's dead-
+  // reckoning drift doesn't smear the fitted line. (Individual dots persist much
+  // longer via pruneRadarMemory/RADAR_DISPLAY_TTL_MS.) Each point is flagged
+  // `fresh` (<= RADAR_TTL_MS) so only genuinely fresh returns feed the nav-facing
+  // liveScan below — autonomy never acts on a stale bearing.
+  const sides = [[], [], [], []];
+  for (const [slot, e] of radarMemory) {
+    if (!e.value || e.value >= 999 || now - e.t > RADAR_WALL_FIT_TTL_MS) continue;
+    if (e.value > sim.maxRange) continue;
+    const rel = normalizeDeg(slot - heading); // 0..360 from bow
+    const side = Math.floor(rel / 90) % 4;
+    sides[side].push({ bearingRel: wrap180(rel), r: e.value, fresh: now - e.t <= RADAR_TTL_MS });
+  }
+
+  for (let side = 0; side < 4; side += 1) {
+    const pts = sides[side];
+    if (pts.length < RADAR_FIT_MIN_POINTS) {
+      radarWalls.delete(side);
+      continue;
+    }
+    // Local Cartesian, bow frame: x = r·sinβ (right), y = r·cosβ (forward).
+    const xy = pts.map((p) => {
+      const a = degToRad(p.bearingRel);
+      return { b: p.bearingRel, x: Math.sin(a) * p.r, y: Math.cos(a) * p.r, fresh: p.fresh };
+    });
+    let mx = 0;
+    let my = 0;
+    for (const q of xy) {
+      mx += q.x;
+      my += q.y;
+    }
+    mx /= xy.length;
+    my /= xy.length;
+    let Sxx = 0;
+    let Syy = 0;
+    let Sxy = 0;
+    for (const q of xy) {
+      const dx = q.x - mx;
+      const dy = q.y - my;
+      Sxx += dx * dx;
+      Syy += dy * dy;
+      Sxy += dx * dy;
+    }
+    // Principal axis = line direction (ux,uy); its normal is (nx,ny).
+    const theta = 0.5 * Math.atan2(2 * Sxy, Sxx - Syy);
+    const ux = Math.cos(theta);
+    const uy = Math.sin(theta);
+    const nx = -uy;
+    const ny = ux;
+    // Reject sides whose points don't lie on a line (scattered bodies / open
+    // water), so we never draw a wall that isn't there.
+    let res = 0;
+    for (const q of xy) {
+      const d = (q.x - mx) * nx + (q.y - my) * ny;
+      res += d * d;
+    }
+    res = Math.sqrt(res / xy.length);
+    if (res > RADAR_FIT_MAX_RESIDUAL_CM) {
+      radarWalls.delete(side);
+      continue;
+    }
+    // Extent of the visible segment along the fitted line.
+    let tMin = Infinity;
+    let tMax = -Infinity;
+    for (const q of xy) {
+      const t = (q.x - mx) * ux + (q.y - my) * uy;
+      if (t < tMin) tMin = t;
+      if (t > tMax) tMax = t;
+    }
+    // Segment endpoints (bow frame) -> frozen world coordinates.
+    const toWorld = (px, py) => {
+      const r = Math.hypot(px, py);
+      const b = (Math.atan2(px, py) * 180) / Math.PI; // bow-relative bearing
+      const wb = degToRad(heading + b);
+      return { x: bx + Math.sin(wb) * r, y: by + Math.cos(wb) * r };
+    };
+    let w1 = toWorld(mx + tMin * ux, my + tMin * uy);
+    let w2 = toWorld(mx + tMax * ux, my + tMax * uy);
+
+    // Temporal smoothing in WORLD frame: a real wall barely moves, so EMA the
+    // endpoints (matching new ends to the nearest previous ends, since the fit's
+    // orientation can flip) to stop the line jumping on small range changes.
+    const prev = radarWalls.get(side);
+    if (prev) {
+      const dDirect =
+        Math.hypot(w1.x - prev.x1, w1.y - prev.y1) + Math.hypot(w2.x - prev.x2, w2.y - prev.y2);
+      const dSwap =
+        Math.hypot(w1.x - prev.x2, w1.y - prev.y2) + Math.hypot(w2.x - prev.x1, w2.y - prev.y1);
+      if (dSwap < dDirect) {
+        const tmp = w1;
+        w1 = w2;
+        w2 = tmp;
+      }
+      const A = RADAR_WALL_SMOOTH;
+      w1 = { x: prev.x1 + (w1.x - prev.x1) * A, y: prev.y1 + (w1.y - prev.y1) * A };
+      w2 = { x: prev.x2 + (w2.x - prev.x2) * A, y: prev.y2 + (w2.y - prev.y2) * A };
+    }
+    radarWalls.set(side, { x1: w1.x, y1: w1.y, x2: w2.x, y2: w2.y, t: now });
+
+    // Feed the nav from the SMOOTHED line: convert the (smoothed) world endpoints
+    // back to the current bow frame, rebuild the line there, then push each
+    // bearing's corrected range into liveScan. This makes liveCone rely on the
+    // same steady wall the display shows, so smoothing helps autonomy too.
+    const toBow = (wx, wy) => {
+      const dx = wx - bx;
+      const dy = wy - by;
+      const r = Math.hypot(dx, dy);
+      const b = degToRad(normalizeDeg((Math.atan2(dx, dy) * 180) / Math.PI) - heading);
+      return { x: Math.sin(b) * r, y: Math.cos(b) * r };
+    };
+    const p1 = toBow(w1.x, w1.y);
+    const p2 = toBow(w2.x, w2.y);
+    let sux = p2.x - p1.x;
+    let suy = p2.y - p1.y;
+    const slen = Math.hypot(sux, suy) || 1;
+    sux /= slen;
+    suy /= slen;
+    const snx = -suy;
+    const sny = sux;
+    const sMn = p1.x * snx + p1.y * sny;
+    for (const q of xy) {
+      // Only fresh returns feed the navigator; older points are display-only so
+      // autonomy never treats a stale bearing as a live, confirmed reading.
+      if (!q.fresh) continue;
+      const a = degToRad(q.b);
+      const denom = Math.sin(a) * snx + Math.cos(a) * sny;
+      if (Math.abs(denom) >= 1e-3) {
+        const rr = sMn / denom;
+        if (rr > 0) {
+          // liveScan is keyed in the RAW (pose-free) bow frame exactly like
+          // updateLiveScan: bin = binBearing(rawBearing - bowOff). q.b is already
+          // that raw bearing (slot - heading), so DON'T add heading back here.
+          const bin = binBearing(q.b - bowOff);
+          liveScan.set(bin, { dist: rr, t: now });
+        }
+      }
+    }
+  }
+
+  // Drop walls we haven't been able to refresh for a while.
+  for (const [side, w] of radarWalls) {
+    if (now - w.t > WALL_TTL_MS) radarWalls.delete(side);
+  }
+}
+
 function updateRadarMemory() {
   // The whole sensor array is rotated by the current servo angle AND by the
   // boat's heading. Store each reading at its ABSOLUTE world bearing so that a
@@ -2440,6 +2796,10 @@ function updateRadarMemory() {
   const bx = state.pose.x;
   const by = state.pose.y;
   const now = performance.now();
+  // A genuine telemetry frame just arrived: mark the picture fresh so radarClock
+  // tracks real time. When frames stop, this stops advancing and the display
+  // ageing clock freezes, keeping the last radar picture visible.
+  lastRadarFreshAt = now;
   for (const beam of SENSOR_BEAMS) {
     const absSlot = normalizeDeg(heading + beam.dir + sweep);
     const newVal = state.telemetry[beam.key];
@@ -2463,11 +2823,15 @@ function updateRadarMemory() {
   }
 }
 
-// Remove slots whose last real measurement is older than the TTL.
+// Remove slots whose last real measurement is older than the DISPLAY TTL. Uses
+// the frozen display clock so a comms dropout doesn't prune the last picture
+// away, and the longer RADAR_DISPLAY_TTL_MS window keeps each bearing on screen
+// across a full slow real-HW sweep so the picture stays continuous (nav-facing
+// consumers still re-filter these entries at the shorter RADAR_TTL_MS).
 function pruneRadarMemory() {
-  const now = performance.now();
+  const now = radarClock();
   for (const [slot, entry] of radarMemory) {
-    if (now - entry.t > RADAR_TTL_MS) {
+    if (now - entry.t > RADAR_DISPLAY_TTL_MS) {
       radarMemory.delete(slot);
     }
   }
@@ -2496,7 +2860,10 @@ function drawSensorArcs(cx, cy, maxR) {
     if (dist > sim.maxRange) continue;
     const absBearing = normalizeDeg((Math.atan2(dx, dy) * 180) / Math.PI);
     const pixelDist = (dist / sim.maxRange) * maxR;
-    const relSlot = normalizeDeg(absBearing - heading);
+    // Center the picture on the sweep midpoint so a sensor's mid-sweep (= the
+    // bow for the front sensor) points straight up and scans symmetrically
+    // right-left, instead of sweeping off to one side.
+    const relSlot = normalizeDeg(absBearing - heading - SWEEP_CENTER_DEG);
     const rad = degToRad(relSlot) - Math.PI / 2;
     points.push({
       slot: absBearing,
@@ -2523,32 +2890,42 @@ function drawSensorArcs(cx, cy, maxR) {
     )
   );
 
-  // Connect neighbours that belong to the same continuous surface (a wall):
-  // adjacent bearing slots (<= ~20° apart) whose ranges are close. Grazing-angle
-  // steps along a flat wall grow with 1/cos, so the range gap between two 15°
-  // slots can reach ~55 cm near the wall edges; 70 cm covers that while still
-  // leaving well-separated bodies as isolated dots.
-  signal.sort((a, b) => a.slot - b.slot);
-  radarCtx.strokeStyle = "rgba(44, 255, 197, 0.55)";
-  radarCtx.lineWidth = 2;
-  for (let i = 0; i < signal.length; i += 1) {
-    const a = signal[i];
-    const b = signal[(i + 1) % signal.length];
-    if (signal.length < 2) break;
-    if (absAngleDiffDeg(a.slot, b.slot) <= 20 && Math.abs(a.dist - b.dist) <= 45) {
-      radarCtx.beginPath();
-      radarCtx.moveTo(a.x, a.y);
-      radarCtx.lineTo(b.x, b.y);
-      radarCtx.stroke();
-    }
-    if (signal.length === 2) break; // avoid drawing the same pair twice
+  // Draw the per-side fitted wall as ONE solid, gap-free segment. This replaces
+  // the old "connect adjacent dots" logic, which broke whenever the slow real-HW
+  // sweep skipped a 15° slot (leaving >20° gaps that never joined) — the very
+  // thing that made a wall look like scattered, blinking dots. The segment is
+  // frozen in world space and reprojected to the boat's current pose, and it
+  // survives WALL_TTL_MS so it stays steady between sweeps.
+  const wallToPixel = (wx, wy) => {
+    const dx = wx - bx;
+    const dy = wy - by;
+    const dist = Math.hypot(dx, dy);
+    const absBearing = normalizeDeg((Math.atan2(dx, dy) * 180) / Math.PI);
+    const relSlot = normalizeDeg(absBearing - heading - SWEEP_CENTER_DEG);
+    const rad = degToRad(relSlot) - Math.PI / 2;
+    const pixelDist = (Math.min(dist, sim.maxRange) / sim.maxRange) * maxR;
+    return { x: cx + Math.cos(rad) * pixelDist, y: cy + Math.sin(rad) * pixelDist };
+  };
+  radarCtx.strokeStyle = "rgba(44, 255, 197, 0.85)";
+  radarCtx.lineWidth = 3;
+  radarCtx.lineCap = "round";
+  const now = radarClock();
+  for (const [, w] of radarWalls) {
+    if (now - w.t > WALL_TTL_MS) continue;
+    const a = wallToPixel(w.x1, w.y1);
+    const b = wallToPixel(w.x2, w.y2);
+    radarCtx.beginPath();
+    radarCtx.moveTo(a.x, a.y);
+    radarCtx.lineTo(b.x, b.y);
+    radarCtx.stroke();
   }
 
-  // Draw each detection as a small blip on top of the connecting lines.
-  radarCtx.fillStyle = "rgba(44, 255, 197, 0.95)";
+  // Draw each raw detection as a faint blip on top, so the underlying returns
+  // are still visible behind the smoothed wall line.
+  radarCtx.fillStyle = "rgba(44, 255, 197, 0.6)";
   for (const p of signal) {
     radarCtx.beginPath();
-    radarCtx.arc(p.x, p.y, 2.5, 0, Math.PI * 2);
+    radarCtx.arc(p.x, p.y, 2, 0, Math.PI * 2);
     radarCtx.fill();
   }
 }
@@ -2559,9 +2936,9 @@ function drawSensorBeams(cx, cy, maxR) {
   radarCtx.save();
   radarCtx.lineWidth = 1.5;
   for (const beam of SENSOR_BEAMS) {
-    const startRad = degToRad(beam.dir + sweep - fovHalf);
-    const endRad = degToRad(beam.dir + sweep + fovHalf);
-    const centerRad = degToRad(beam.dir + sweep);
+    const startRad = degToRad(beam.dir + sweep - SWEEP_CENTER_DEG - fovHalf);
+    const endRad = degToRad(beam.dir + sweep - SWEEP_CENTER_DEG + fovHalf);
+    const centerRad = degToRad(beam.dir + sweep - SWEEP_CENTER_DEG);
 
     // Soft FOV fill
     radarCtx.fillStyle = beam.color.replace(", 1)", ", 0.08)");
