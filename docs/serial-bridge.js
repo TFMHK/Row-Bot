@@ -66,12 +66,15 @@
   function buildSerialLine(command, motorLeftAbs, motorRightAbs) {
     let physicalLeft = shapeMotorSpeed(command.rightSpeed);
     let physicalRight = shapeMotorSpeed(command.leftSpeed);
+    // The abs multipliers follow the SAME channel swap as above, so
+    // motorLeftAbs governs the physical left motor (emitted on the right slot)
+    // and motorRightAbs the physical right motor.
     if (physicalLeft !== 0) {
-      const mag = clamp(Math.trunc(motorLeftAbs), 0, MOTOR_HIGH_SPEED);
+      const mag = clamp(Math.trunc(motorRightAbs), 0, MOTOR_HIGH_SPEED);
       physicalLeft = physicalLeft > 0 ? mag : -mag;
     }
     if (physicalRight !== 0) {
-      const mag = clamp(Math.trunc(motorRightAbs), 0, MOTOR_HIGH_SPEED);
+      const mag = clamp(Math.trunc(motorLeftAbs), 0, MOTOR_HIGH_SPEED);
       physicalRight = physicalRight > 0 ? mag : -mag;
     }
     const physicalWinch = -command.winchSpeed;

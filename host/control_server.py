@@ -151,6 +151,22 @@ def shape_motor_speed(value: int) -> int:
     return stepped if value > 0 else -stepped
 
 
+def motor_direction(value: int) -> int:
+    """Return a drive motor's direction: +1 ahead, -1 astern, 0 stopped.
+
+    Mirrors shape_motor_speed's dead zone. On the real boat every running motor
+    turns at its fixed per-motor calibration speed (build_serial_line overrides
+    the magnitude), so only each motor's DIRECTION affects how the hull moves —
+    the joystick just picks forward / reverse / stop per motor.
+    """
+    shaped = shape_motor_speed(value)
+    if shaped > 0:
+        return 1
+    if shaped < 0:
+        return -1
+    return 0
+
+
 def build_serial_line(
     command: "CommandState",
     motor_left_abs: int = MOTOR_LEFT_ABS_DEFAULT,
@@ -175,12 +191,15 @@ def build_serial_line(
     physicalLeft = shape_motor_speed(command.rightSpeed)
     physicalRight = shape_motor_speed(command.leftSpeed)
     # Override each driving motor's magnitude with its operator-set absolute
-    # speed. An already-off motor (0) stays off; the sign/direction is preserved.
+    # speed. The abs values follow the SAME channel swap as above, so
+    # motor_left_abs governs the physical left motor (emitted on the right slot)
+    # and motor_right_abs the physical right motor. An already-off motor (0)
+    # stays off; the sign/direction is preserved.
     if physicalLeft != 0:
-        mag = clamp(int(motor_left_abs), 0, MOTOR_HIGH_SPEED)
+        mag = clamp(int(motor_right_abs), 0, MOTOR_HIGH_SPEED)
         physicalLeft = mag if physicalLeft > 0 else -mag
     if physicalRight != 0:
-        mag = clamp(int(motor_right_abs), 0, MOTOR_HIGH_SPEED)
+        mag = clamp(int(motor_left_abs), 0, MOTOR_HIGH_SPEED)
         physicalRight = mag if physicalRight > 0 else -mag
     physicalWinch = -command.winchSpeed
     return (
@@ -677,18 +696,31 @@ class SerialBridge:
                 dt = max(0.01, now - self._sim_last_ts)
                 self._sim_last_ts = now
                 
-                # Update boat dynamics from joystick commands. The real boat can
-                # only ever drive each motor at 0 or within [70, 100]
-                # (build_serial_line shapes every packet), so the simulated hull
-                # must obey the SAME shaping — otherwise the sim would move
-                # differently than the boat ever can. This also shapes the
-                # autonomous controller, which drives through this exact physics.
-                left_cmd = shape_motor_speed(self._state.command.leftSpeed)
-                right_cmd = shape_motor_speed(self._state.command.rightSpeed)
-                # Throttle: average of left and right speeds (0-1 range)
-                throttle = (left_cmd + right_cmd) / (2 * 255)
-                # Turn: difference of left and right speeds (rotation)
-                turn = (right_cmd - left_cmd) / (2 * 255)
+                # Update boat dynamics from the motor commands, using the EXACT
+                # model the real boat obeys so the sim maneuvers like the water.
+                # Each drive motor is only three-state on the boat: full ahead,
+                # full astern, or stopped. build_serial_line forces a running
+                # motor's magnitude to its per-motor calibration speed, and that
+                # calibration exists ONLY to equalise the two motors' effective
+                # thrust — so here both running motors deliver the SAME unit
+                # thrust and the joystick decides only each motor's direction.
+                # That is what produces the real maneuvering:
+                #   both ahead               -> straight
+                #   one ahead, other stopped -> forward arc (turns while moving)
+                #   one ahead, other astern  -> spin in place
+                # (The autonomous controller drives through this exact physics.)
+                left_dir = motor_direction(self._state.command.leftSpeed)
+                right_dir = motor_direction(self._state.command.rightSpeed)
+                # Shared effective drive level (fraction of full 0..255 scale).
+                # The two calibration speeds are tuned to be equal in effect, so
+                # use their mean as the common thrust magnitude for both motors.
+                motor_level = (
+                    self._state.motorLeftAbs + self._state.motorRightAbs
+                ) / 2.0 / 255.0
+                # Throttle: net forward drive (both motors contribute equally).
+                throttle = (left_dir + right_dir) / 2.0 * motor_level
+                # Turn: differential drive (rotation) from the two directions.
+                turn = (right_dir - left_dir) / 2.0 * motor_level
 
                 # Linear momentum: thrust from the motors fights water drag, so
                 # the hull glides on after the throttle drops instead of stopping

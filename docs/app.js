@@ -3059,10 +3059,11 @@ function pruneRadarMemory() {
 function drawSensorArcs(cx, cy, maxR) {
   pruneRadarMemory();
 
-  // radarMemory holds each detection FROZEN at the world point where it was
-  // measured. Reproject it relative to the boat's CURRENT pose so a stationary
-  // obstacle slides toward the boat/centre as it advances, instead of sticking
-  // at its original range until the servo refreshes that bearing.
+  // radarMemory holds each detection at the bearing/range where it was measured.
+  // The dots are drawn boat-fixed: they do NOT slide as the boat advances (that
+  // motion-simulation is intentionally disabled) — a dot simply stays put until
+  // its TTL expires (pruneRadarMemory) and it is deleted on its own. Rotation is
+  // still reflected via (absBearing - heading) so the bow stays pointing up.
   const heading = state.pose.headingDeg;
   const bx = state.pose.x;
   const by = state.pose.y;
@@ -3073,11 +3074,9 @@ function drawSensorArcs(cx, cy, maxR) {
   const points = [];
   for (const [absSlot, entry] of radarMemory) {
     if (!entry.value || entry.value >= 999) continue;
-    const dx = entry.wx - bx;
-    const dy = entry.wy - by;
-    const dist = Math.hypot(dx, dy);
+    const dist = entry.value;
     if (dist > sim.maxRange) continue;
-    const absBearing = normalizeDeg((Math.atan2(dx, dy) * 180) / Math.PI);
+    const absBearing = absSlot;
     const pixelDist = (dist / sim.maxRange) * maxR;
     // Center the picture on the sweep midpoint so a sensor's mid-sweep (= the
     // bow for the front sensor) points straight up and scans symmetrically

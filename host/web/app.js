@@ -53,6 +53,11 @@ const state = {
   manualMode: true,
   // Committed autonomous avoidance turn: 0 = none, -1 = turning left, +1 = right.
   avoidDir: 0,
+  // מהירויות המנוע המוחלטות (כיול), נדחפות מהשרת. המנועים 3-מצביים: קדימה / אחורה
+  // / עצור, והעוצמה של כל מנוע נקבעת מהכיול (שנועד רק להשוות ביניהם למהירות
+  // אפקטיבית שווה). אומדן הפוזה משתמש בהן כדי לשקף את המהירות/התמרון האמיתיים.
+  motorLeftAbs: 90,
+  motorRightAbs: 80,
   // אודומטריה צד-לקוח (dead-reckoning): אומדן פוזה מתוך אינטגרציה של אותן
   // פקודות המנועים שאנו שולחים, באותו מודל קינמטי כמו הסירה/הסימולטור. זה מה
   // שחומרה אמיתית תעשה (אין GPS/מצפן על החוט), ולכן כל מחסנית התפיסה+הניווט רצה
@@ -521,6 +526,10 @@ async function sendMotorConfig(key, input) {
 // Reflect the server's per-motor absolute speeds in the text boxes, but never
 // overwrite a box the operator is actively editing (focused).
 function updateMotorConfigUI(remoteState) {
+  // Keep the calibration magnitudes in state so the pose estimator can mirror
+  // the real boat's speed/maneuvering (motors are 3-state; magnitude = config).
+  if (remoteState.motorLeftAbs != null) state.motorLeftAbs = remoteState.motorLeftAbs;
+  if (remoteState.motorRightAbs != null) state.motorRightAbs = remoteState.motorRightAbs;
   if (document.activeElement !== motorLeftAbsInput && remoteState.motorLeftAbs != null) {
     motorLeftAbsInput.value = String(remoteState.motorLeftAbs);
   }
@@ -1200,12 +1209,20 @@ function applyAvoidTurn(dir) {
 function integratePose(cmd, dtSec) {
   // חשוב: אסור לחתוך זמן אמיתי. השרת (_mock_loop) מאנטגר כל 50ms ללא תקרה
   // עליונה, ולכן אם נחתוך dt קטן (0.2) בכל טיק-רשת איטי/לשונית ברקע — האומדן
-  // "יפגר" בסיבוב אחרי אמת-השרת ושתי הפאנלים יראו כיוון שונה. חותכים רק תקיעה
-  // פתולוגית (לשונית ברקע דקות) כדי לא לשגר את הפוזה.
-  let dt = clamp(dtSec, 0, 1.0);
-  if (dt <= 0) return;
-  // הסירה האמיתית מעצבת כל מנוע ל-{0} ∪ [40,100] לפני שהוא מגיע למנועים, ולכן
-  // האומדן חייב לעצב אף הוא — כך גם ידני וגם אוטונומי מוגבלים לאותה רצועת כוח.
+  // "יפגר" בסיבוב 3-מצבית לכל מנוע: קדימה / אחורה / עצור. הג'ויסטיק (וגם הניווט)
+  // קובע רק את הכיוון של כל מנוע; העוצמה נקבעת מהכיול (motorLeftAbs/motorRightAbs)
+  // שנועד רק להשוות בין המנועים למהירות אפקטיבית שווה. לכן שני מנועים דולקים
+  // נותנים דחף זהה, והתמרון נובע מהכיוונים בלבד:
+  //   שניהם קדימה                 -> ישר
+  //   אחד קדימה, השני עצור         -> קשת קדימה (פנייה תוך כדי תנועה)
+  //   אחד קדימה, השני אחורה        -> סיבוב במקום
+  const leftDir = Math.sign(shapeMotorSpeed(cmd.leftSpeed));
+  const rightDir = Math.sign(shapeMotorSpeed(cmd.rightSpeed));
+  // רמת הכוח האפקטיבית המשותפת (שבר מהסולם 0..255). שתי מהירויות הכיול מושוות
+  // בפועל, לכן משתמשים בממוצע כעוצמת דחף אחידה לשני המנועים — זהה ל-_mock_loop.
+  const motorLevel = ((state.motorLeftAbs ?? 90) + (state.motorRightAbs ?? 80)) / 2 / 255;
+  const throttle = (leftDir + rightDir) / 2 * motorLevel;
+  const turn = (rightDir - leftDir) / 2 * motorLevel וגם אוטונומי מוגבלים לאותה רצועת כוח.
   const left = shapeMotorSpeed(cmd.leftSpeed);
   const right = shapeMotorSpeed(cmd.rightSpeed);
   const throttle = (left + right) / (2 * 255);
@@ -3059,10 +3076,11 @@ function pruneRadarMemory() {
 function drawSensorArcs(cx, cy, maxR) {
   pruneRadarMemory();
 
-  // radarMemory holds each detection FROZEN at the world point where it was
-  // measured. Reproject it relative to the boat's CURRENT pose so a stationary
-  // obstacle slides toward the boat/centre as it advances, instead of sticking
-  // at its original range until the servo refreshes that bearing.
+  // radarMemory holds each detection at the bearing/range where it was measured.
+  // The dots are drawn boat-fixed: they do NOT slide as the boat advances (that
+  // motion-simulation is intentionally disabled) — a dot simply stays put until
+  // its TTL expires (pruneRadarMemory) and it is deleted on its own. Rotation is
+  // still reflected via (absBearing - heading) so the bow stays pointing up.
   const heading = state.pose.headingDeg;
   const bx = state.pose.x;
   const by = state.pose.y;
@@ -3073,11 +3091,9 @@ function drawSensorArcs(cx, cy, maxR) {
   const points = [];
   for (const [absSlot, entry] of radarMemory) {
     if (!entry.value || entry.value >= 999) continue;
-    const dx = entry.wx - bx;
-    const dy = entry.wy - by;
-    const dist = Math.hypot(dx, dy);
+    const dist = entry.value;
     if (dist > sim.maxRange) continue;
-    const absBearing = normalizeDeg((Math.atan2(dx, dy) * 180) / Math.PI);
+    const absBearing = absSlot;
     const pixelDist = (dist / sim.maxRange) * maxR;
     // Center the picture on the sweep midpoint so a sensor's mid-sweep (= the
     // bow for the front sensor) points straight up and scans symmetrically
