@@ -1,6 +1,7 @@
 #include <RH_ASK.h>
 #include <Servo.h>
 #include <Adafruit_NeoPixel.h>
+#include "rf_link.h"  // פריימים דחוסים + אימות MAC (משותף עם shore_radio.cpp)
 
 // רדיו: speed=2000bps, rxPin=7, txPin=4 (שני הקצות חייבים להתאים!)
 // קצב נמוך => מקלט ASK רגיש יותר => טווח טוב יותר. מחיר: זמן-שידור
@@ -86,6 +87,14 @@ struct TelemetryPacket {
 CommandPacket cmd = {0, 0, 0, 90, 0};
 TelemetryPacket telemetry;
 
+// מוני-מחזור (anti-replay) של פרוטוקול ה-RF:
+// lastCmdSeq = ה-seq האחרון שהתקבל מהחוף; telSeq = ה-seq היוצא של הטלמטריה.
+// haveCmdSeq=false => הפריים החתום הראשון אחרי אתחול מתקבל בלי בדיקת-רעננות
+// כדי להסתנכרן למונה של החוף, ואז חוסמים replay של פריימים ישנים.
+uint8_t lastCmdSeq = 0;
+bool haveCmdSeq = false;
+uint8_t telSeq = 0;
+
 // Failsafe: אם לא מתקבלת פקודה תקינה תוך פרק הזמן הזה (למשל אובדן קשר RF),
 // המנועים נעצרים אוטומטית כדי שהסירה לא תמשיך לנוע "בעיוורון" עד לריסט.
 // הועלה מ-800 ל-1500ms כדי "לרכוב מעל" דעיכות RF קצרות (טווח) בלי לעצור מנועים.
@@ -126,6 +135,7 @@ void readAllUltrasonic(int results[4]);
 void showPixel(uint8_t r, uint8_t g, uint8_t b);
 void showModeColor(int mode);
 void slewRadarServoTo(int target);
+void sendTelemetry();
 
 void setup() {
   pinMode(MOTOR1_IN1, OUTPUT);
@@ -166,31 +176,41 @@ void loop() {
   // 1) קליטת פקודות (לא חוסמת): שולטת רק במנועים וברשת. זווית המכם כבר לא מגיעה
   //    מהפקודה — הסריקה מקומית לגמרי. מיד עם קבלת פקודה משדרים טלמטריה ("פינג-
   //    פונג"): החוף בדיוק סיים לשדר ולכן נמצא במצב האזנה, כך שהשידור נוחת אמין.
-  uint8_t buf[sizeof(CommandPacket)];
-  uint8_t buflen = sizeof(CommandPacket);
-  if (driver.recv(buf, &buflen) && buflen == sizeof(CommandPacket)) {
-    memcpy(&cmd, buf, sizeof(CommandPacket));
-    lastCommandMs = now;
-    motorsStopped = false;
-    linkLost = false;
+  //    כל פריים חייב לעבור אימות MAC (מפתח סודי) + בדיקת seq — פריים מגורם זר
+  //    או פריים ישן ש"מנוגן מחדש" נדחה בשקט ולא משפיע על המנועים.
+  uint8_t buf[RH_ASK_MAX_MESSAGE_LEN];
+  uint8_t buflen = sizeof(buf);
+  if (driver.recv(buf, &buflen) && buflen == sizeof(RfCommand)) {
+    RfCommand in;
+    memcpy(&in, buf, sizeof(RfCommand));
+    if (rf_cmd_verify(&in) && (!haveCmdSeq || rf_seq_fresh(in.seq, lastCmdSeq))) {
+      haveCmdSeq = true;
+      lastCmdSeq = in.seq;
+      cmd.leftSpeed  = rf_speed_decode(in.left);
+      cmd.rightSpeed = rf_speed_decode(in.right);
+      cmd.winchSpeed = rf_speed_decode(in.winch);
+      cmd.mode       = (in.flags & 0x01) ? 1 : 0;
+      lastCommandMs = now;
+      motorsStopped = false;
+      linkLost = false;
 
-    driver.send((uint8_t*)&telemetry, sizeof(TelemetryPacket));
-    driver.waitPacketSent();
-    lastTelemetrySentMs = now;
+      sendTelemetry();
+      lastTelemetrySentMs = now;
 
-    controlMotor(MOTOR1_IN1, MOTOR1_IN2, MOTOR1_PWM, cmd.leftSpeed);
-    controlMotor(MOTOR2_IN1, MOTOR2_IN2, MOTOR2_PWM, cmd.rightSpeed);
+      controlMotor(MOTOR1_IN1, MOTOR1_IN2, MOTOR1_PWM, cmd.leftSpeed);
+      controlMotor(MOTOR2_IN1, MOTOR2_IN2, MOTOR2_PWM, cmd.rightSpeed);
 
-    // סרוו הרשת: ממפה מהירות -255..255 לזווית 0..180
-    int netAngle = map(constrain(cmd.winchSpeed, -255, 255), -255, 255, 0, 180);
-    netServo.write(netAngle);
+      // סרוו הרשת: ממפה מהירות -255..255 לזווית 0..180
+      int netAngle = map(constrain(cmd.winchSpeed, -255, 255), -255, 255, 0, 180);
+      netServo.write(netAngle);
 
-    // חיווי מצב על הטבעת: צבע לפי המצב (ידני/אוטומטי) שנשלח מהחוף.
-    // קוראים ל-pixel.show() (שמכבה פסיקות ~240µs) רק כשהמצב משתנה בפועל
-    // — אירוע נדיר — כך שהוא לעולם לא נופל בזמן קליטת פקודות ולא תוקע את המנועים.
-    if (cmd.mode != lastMode) {
-      lastMode = cmd.mode;
-      showModeColor(cmd.mode);
+      // חיווי מצב על הטבעת: צבע לפי המצב (ידני/אוטומטי) שנשלח מהחוף.
+      // קוראים ל-pixel.show() (שמכבה פסיקות ~240µs) רק כשהמצב משתנה בפועל
+      // — אירוע נדיר — כך שהוא לעולם לא נופל בזמן קליטת פקודות ולא תוקע את המנועים.
+      if (cmd.mode != lastMode) {
+        lastMode = cmd.mode;
+        showModeColor(cmd.mode);
+      }
     }
   }
 
@@ -233,8 +253,7 @@ void loop() {
   //    קולט גם ללא תקשורת נכנסת — בלי תלות כפולה בקו התקשורת.
   if (now - lastCommandMs > UPLINK_SILENCE_MS &&
       now - lastTelemetrySentMs >= TELEMETRY_FALLBACK_MS) {
-    driver.send((uint8_t*)&telemetry, sizeof(TelemetryPacket));
-    driver.waitPacketSent();
+    sendTelemetry();
     lastTelemetrySentMs = now;
   }
 
@@ -355,4 +374,20 @@ void showModeColor(int mode) {
   } else {
     showPixel(0, 255, 0);   // ידני = ירוק
   }
+}
+
+// דוחס את הטלמטריה הנוכחית לפריים RfTelemetry, חותם ב-MAC ומשדר. מרחקים
+// נדחסים לבית בודד כל אחד (ס"מ/2, 255=אין הד), הזווית בבית, ומצורף seq עולה
+// למניעת replay + 2 בתי MAC. החוף מאמת את החתימה לפני שהוא מעביר למחשב.
+void sendTelemetry() {
+  RfTelemetry out;
+  out.seq    = telSeq++;
+  out.dRadar = rf_dist_encode(telemetry.usRadar);
+  out.dFront = rf_dist_encode(telemetry.usFront);
+  out.dLeft  = rf_dist_encode(telemetry.usLeft);
+  out.dRight = rf_dist_encode(telemetry.usRight);
+  out.angle  = (uint8_t)constrain(telemetry.radarAngle, 0, 180);
+  rf_tel_sign(&out);
+  driver.send((uint8_t*)&out, sizeof(RfTelemetry));
+  driver.waitPacketSent();
 }
