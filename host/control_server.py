@@ -13,6 +13,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import serial
 from serial.tools import list_ports
@@ -46,6 +47,31 @@ def navlog_append(records: list, reset: bool = False) -> str:
             for rec in records:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         return _navlog_file.name
+
+
+def list_navlogs() -> list:
+    """Return recorded run logs (newest first) with byte size + record count.
+
+    Used by the UI's replay picker so the operator can choose a recorded sail
+    to physically play back.
+    """
+    if not LOG_DIR.exists():
+        return []
+    out = []
+    for p in sorted(LOG_DIR.glob("nav-*.ndjson"), key=lambda x: x.stat().st_mtime, reverse=True):
+        try:
+            st = p.stat()
+            with p.open("r", encoding="utf-8") as fh:
+                records = sum(1 for line in fh if line.strip())
+        except OSError:
+            continue
+        out.append({
+            "name": p.name,
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+            "records": records,
+        })
+    return out
 
 
 # How often the server re-sends the last command over serial while connected.
@@ -99,10 +125,10 @@ MOTOR_HIGH_SPEED = 100     # top of the usable band
 # direction (sign); this only overrides the magnitude, so the operator can tune
 # each motor's absolute speed live from the UI to balance a weaker motor without
 # reflashing the boat (applied host-side in build_serial_line; the logical
-# CommandState is unchanged). Defaults preserve the previous calibration: the
-# left motor ran ~90 and the right ~80. Clamped to [0, MOTOR_HIGH_SPEED].
-MOTOR_LEFT_ABS_DEFAULT = 90
-MOTOR_RIGHT_ABS_DEFAULT = 80
+# CommandState is unchanged). Default calibration: left motor 84, right motor
+# 88. Clamped to [0, MOTOR_HIGH_SPEED].
+MOTOR_LEFT_ABS_DEFAULT = 84
+MOTOR_RIGHT_ABS_DEFAULT = 88
 
 # Ultrasonic readings closer than this are treated as spurious (echo ring-down,
 # hull reflections, sensor cross-talk) and are discarded — mapped to the
@@ -176,9 +202,12 @@ def build_serial_line(
 
     These fixes live here (host side) so the boat firmware never needs
     re-flashing:
-    - The two drive motor channels are SWAPPED before sending: the logical left
-      speed is emitted on the right channel and vice versa, to match the boat's
-      physical wiring (left/right were reversed on the hardware).
+    - The two drive motor channels map STRAIGHT THROUGH (logical left -> physical
+      left slot, logical right -> right slot). They used to be swapped on the
+      assumption the hardware wiring was reversed, but field observation showed
+      the autonomous TURN went the wrong way while forward/back were correct —
+      the signature of an inverted turn only — so the swap was removed. If the
+      turn direction is ever found inverted again, swap the two lines below.
     - The net winch motor is wired with reversed polarity, so its speed is
       inverted.
     The drive motor speeds are shaped via shape_motor_speed() so each wheel is
@@ -187,19 +216,18 @@ def build_serial_line(
     The logical CommandState kept in the bridge state stays unchanged, so the
     UI and mock trajectory still see left/right/winch in their intended sense.
     """
-    # Swap channels: logical left -> physical right slot, logical right -> left.
-    physicalLeft = shape_motor_speed(command.rightSpeed)
-    physicalRight = shape_motor_speed(command.leftSpeed)
+    # Straight-through: logical left -> physical left slot, logical right -> right.
+    physicalLeft = shape_motor_speed(command.leftSpeed)
+    physicalRight = shape_motor_speed(command.rightSpeed)
     # Override each driving motor's magnitude with its operator-set absolute
-    # speed. The abs values follow the SAME channel swap as above, so
-    # motor_left_abs governs the physical left motor (emitted on the right slot)
-    # and motor_right_abs the physical right motor. An already-off motor (0)
-    # stays off; the sign/direction is preserved.
+    # speed. motor_left_abs governs the physical left motor, motor_right_abs the
+    # physical right motor. An already-off motor (0) stays off; the sign/direction
+    # is preserved.
     if physicalLeft != 0:
-        mag = clamp(int(motor_right_abs), 0, MOTOR_HIGH_SPEED)
+        mag = clamp(int(motor_left_abs), 0, MOTOR_HIGH_SPEED)
         physicalLeft = mag if physicalLeft > 0 else -mag
     if physicalRight != 0:
-        mag = clamp(int(motor_left_abs), 0, MOTOR_HIGH_SPEED)
+        mag = clamp(int(motor_right_abs), 0, MOTOR_HIGH_SPEED)
         physicalRight = mag if physicalRight > 0 else -mag
     physicalWinch = -command.winchSpeed
     return (
@@ -841,24 +869,26 @@ class SerialBridge:
         }
 
     def _create_rectangle_targets(self) -> list[dict]:
-        """Three thin straight baffle walls inside the rectangular pool.
+        """Three baffle walls inside the pool — EXACT real-world geometry.
 
-        Each wall is a single 5 cm-thick line segment spanning part of the 2.2 m
-        width. The lower baffle grows from the LEFT wall (gap on the right); the
-        middle baffle grows from the RIGHT wall (gap on the left); the upper
-        baffle grows from the LEFT wall again (gap on the right). Crossing from
-        the bottom-left start to the top-left goal forces a weave:
-        up -> right -> up -> left -> up -> right -> up.
+        Pool: 2.2 m wide (x, half=110) × 4.5 m long (y, half=225). Each baffle is
+        a single straight wall 90 cm long × 5 cm thick. TWO grow from the LEFT
+        wall (x=-hx), positioned 1.5 m from the bottom and top end walls
+        (y = -hy+150 = -75 and y = +hy-150 = +75); ONE grows from the RIGHT wall
+        (x=+hx) exactly at the middle (y=0). The left tips reach x=-hx+90=-20 and
+        the right tip reaches x=+hx-90=+20, so each leaves a 130 cm gap on the
+        opposite side. Crossing bottom->top forces a weave: right -> left -> right.
 
-          baffle1 wall LEFT,  tip x=-35 -> gap x > -35  (forces boat RIGHT)
-          baffle2 wall RIGHT, tip x=+35 -> gap x < +35  (boat back toward LEFT)
-          baffle3 wall LEFT,  tip x=-35 -> gap x > -35  (forces boat RIGHT again)
+          left  @ y=-75 (x:-110..-20) -> gap on the RIGHT
+          right @ y=0    (x:+110..+20) -> gap on the LEFT
+          left  @ y=+75 (x:-110..-20) -> gap on the RIGHT
         """
         hx = self._sim_bounds_half_x
+        hy = self._sim_bounds_half_y
         self._sim_walls = [
-            self._make_wall(-hx, -70.0, -35.0, -70.0),  # lower baffle:  wall LEFT
-            self._make_wall(hx, 0.0, 35.0, 0.0),        # middle baffle: wall RIGHT
-            self._make_wall(-hx, 70.0, -35.0, 70.0),    # upper baffle:  wall LEFT
+            self._make_wall(-hx, -(hy - 150.0), -hx + 90.0, -(hy - 150.0)),  # left, 1.5m from bottom
+            self._make_wall(hx, 0.0, hx - 90.0, 0.0),                        # right, middle
+            self._make_wall(-hx, hy - 150.0, -hx + 90.0, hy - 150.0),        # left, 1.5m from top
         ]
         return []  # geometry lives in self._sim_walls, not as circle bodies
 
@@ -1010,6 +1040,14 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             self._send_json(BRIDGE.world_snapshot())
             return
 
+        if self.path == "/api/logs":
+            self._send_json({"logs": list_navlogs()})
+            return
+
+        if self.path.startswith("/api/logs/"):
+            self._serve_navlog(self.path[len("/api/logs/"):])
+            return
+
         self._serve_static()
 
     def do_POST(self) -> None:
@@ -1114,6 +1152,32 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             return
 
+    def _serve_navlog(self, name: str) -> None:
+        """Stream one recorded run log (NDJSON) back for playback.
+
+        Path is strictly validated to a `nav-*.ndjson` file inside LOG_DIR so a
+        crafted name can't traverse out of the logs directory.
+        """
+        name = unquote(name).split("?", 1)[0]
+        if ("/" in name or "\\" in name or ".." in name
+                or not name.startswith("nav-") or not name.endswith(".ndjson")):
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        file_path = (LOG_DIR / name).resolve()
+        if not str(file_path).startswith(str(LOG_DIR.resolve())) or not file_path.is_file():
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        raw = file_path.read_bytes()
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return
+
     def _serve_static(self) -> None:
         target = self.path.split("?", 1)[0]
         if target in ("/", ""):
@@ -1131,6 +1195,10 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(raw)))
+            # Local single-user control UI: always serve the latest file so a
+            # firmware/UI fix reaches the browser (and phone) without a manual
+            # hard-refresh. Files are tiny, so skipping the cache costs nothing.
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(raw)
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):

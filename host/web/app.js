@@ -10,6 +10,13 @@ const refreshPortsBtn = document.getElementById("refreshPortsBtn");
 const serverMessage = document.getElementById("serverMessage");
 const downloadNavBtn = document.getElementById("downloadNavBtn");
 
+const replaySelect = document.getElementById("replaySelect");
+const replayRefreshBtn = document.getElementById("replayRefreshBtn");
+const replayPlayBtn = document.getElementById("replayPlayBtn");
+const replayStopBtn = document.getElementById("replayStopBtn");
+const replayLoopChk = document.getElementById("replayLoopChk");
+const replayStatus = document.getElementById("replayStatus");
+
 const leftSpeedValue = document.getElementById("leftSpeedValue");
 const rightSpeedValue = document.getElementById("rightSpeedValue");
 const radarAngleValue = document.getElementById("radarAngleValue");
@@ -56,8 +63,8 @@ const state = {
   // מהירויות המנוע המוחלטות (כיול), נדחפות מהשרת. המנועים 3-מצביים: קדימה / אחורה
   // / עצור, והעוצמה של כל מנוע נקבעת מהכיול (שנועד רק להשוות ביניהם למהירות
   // אפקטיבית שווה). אומדן הפוזה משתמש בהן כדי לשקף את המהירות/התמרון האמיתיים.
-  motorLeftAbs: 90,
-  motorRightAbs: 80,
+  motorLeftAbs: 84,
+  motorRightAbs: 88,
   // אודומטריה צד-לקוח (dead-reckoning): אומדן פוזה מתוך אינטגרציה של אותן
   // פקודות המנועים שאנו שולחים, באותו מודל קינמטי כמו הסירה/הסימולטור. זה מה
   // שחומרה אמיתית תעשה (אין GPS/מצפן על החוט), ולכן כל מחסנית התפיסה+הניווט רצה
@@ -86,8 +93,17 @@ const state = {
     calibStart: 0,         // חותמת-זמן תחילת פעימת-הזרע
     // --- פולסי-סיבוב קצרים (סיבוב במקום בציר 0, לא קשתות) ---
     spinUntil: 0,          // חותמת-זמן: עד מתי הפולס הנוכחי מסובב במקום
+    spinDir: 0,            // כיוון הסיבוב-במקום הנוכחי (-1 שמאל, +1 ימין)
     settleUntil: 0,        // חותמת-זמן: עד מתי מיישרים/עוצרים בין פולסים
+    // --- בריחה מקיר קרוב: אחרי שכיוונּו את החרטום הרחק מהקיר, נוסעים ישר קדימה
+    // כדי באמת להתרחק (סיבוב-במקום לבדו לא מזיז אותנו מהקיר וגורם לנדנוד). ---
+    wallEscapeUntil: 0,    // חותמת-זמן: עד מתי מחויבים לנסיעה-ישר להתרחקות מקיר
+    wallEscapeSide: 0,     // איזה קיר בורחים ממנו (-1 שמאל, +1 ימין)
     reverseUntil: 0,       // חותמת-זמן: עד מתי נמשך פרץ-הנסיעה-לאחור המחויב
+    reverseArcDir: 0,      // כיוון קשת-הנסיעה-לאחור (0=ישר, -1 שמאל, +1 ימין)
+    sideUntil: 0,          // חותמת-זמן: עד מתי מפעילים מנוע-צד בודד (התחמקות מקיר-צד קרוב)
+    sideDir: 0,            // איזה מנוע-צד פעיל כעת (-1 = שמאל, +1 = ימין)
+    fwdUntil: 0,           // חותמת-זמן: עד מתי פרץ נסיעה-קדימה (בריחה מקיר שמאחור בזמן נסיגה)
   },
   telemetry: {
     usRadar: null,
@@ -110,10 +126,21 @@ const state = {
     y: 0,
     active: false,
   },
+  // ניגון חוזר (teach-and-repeat): מנגן מסלול שהוקלט על-ידי שליחת אותן פקודות
+  // מנוע/כננת לפי התזמון המקורי, כך שהסירה מבצעת פיזית את הנסיעה מחדש.
+  replay: {
+    active: false,
+    records: [],       // רשומות המסלול המוקלט (t + cmd)
+    index: 0,          // מיקום נוכחי במסלול
+    baseT: 0,          // חותמת-הזמן של הרשומה הראשונה (עוגן לתזמון יחסי)
+    startWallT: 0,     // performance.now() ברגע תחילת הניגון
+    name: "",          // שם קובץ המסלול המתנגן
+    loop: false,       // ניגון בלולאה אינסופית
+  },
 };
 
 const sim = {
-  maxRange: 100,
+  maxRange: 200,
 };
 
 // Ground-truth mock world (obstacle bodies + boundary), fetched once per mock
@@ -167,10 +194,6 @@ function shapeMotorSpeed(value) {
 // כוח המנוע {0} ∪ [70, 100] (shapeMotorSpeed ב-computeSafeCommand/integratePose +
 // shape_motor_speed בשרת), כך שבפועל המנוע רץ ברצועה הזו — גם באוטונומי.
 const AUTONOMOUS_SPEED = 135;
-// Slowest forward speed while threading past a nearby obstacle. Easing down to
-// this as the bow closes in gives the servo sweep time to refresh the picture
-// and lets the turn actually bite before impact.
-const AUTONOMOUS_MIN_SPEED = 75;
 const AVOID_SPEED = 170;
 // Below this front distance the boat commits to spinning in place toward open
 // water. It keeps spinning (hysteresis) until the bow is clear past
@@ -288,6 +311,23 @@ const RADAR_GAPFILL_MAX_SPAN_DEG = 80;   // לא ממלאים פער זווית�
 // והבלימים שלא רועננו פגים כרגיל. הערך קטן מ-RADAR_DISPLAY_TTL_MS כך שאף בליפ לא נמחק לפני הקיפאון.
 const RADAR_FREEZE_AFTER_MS = 1500;
 
+// --- שער ייצוב-תמונה בזמן סיבוב במקום ---------------------------------------
+// אין מצפן/IMU על החוט, ולכן ה-heading מוערך ב-dead-reckoning מהפקודות בלבד. בזמן
+// סיבוב במקום ההערכה לא אמינה (כיול קצב-סחרור, החלקה, שיהוי קישור), וכל הד נשמר
+// בזווית-עולם שגויה — התמונה "נמרחת"/מסתחררת. לכן: כשקצב-הסחרור עולה מעל הסף
+// מקפיאים את צבירת המכ"ם ומנקים את התמונה הישנה (שנשמרה תחת heading שכבר לא תקף),
+// ומחזיקים אותה "לא-יציבה" עוד RADAR_SETTLE_MS אחרי שהסיבוב נעצר — כדי שסריקה
+// טרייה תבנה אותה מחדש לפני שהניווט/המפעיל מסתמכים עליה שוב. חל על חומרה אמיתית
+// בלבד (בסימולטור ה-heading הוא אמת-קרקע, אז אין מריחה ואין צורך לשער).
+const RADAR_SPIN_RATE_DEG_S = 12;   // סף קצב-סחרור (°/ש') שמעליו הפוזה לא אמינה — סיבוב-במקום ~15°/ש', קשת ~7.5°/ש'
+const RADAR_SETTLE_MS = 1400;       // מינימום זמן-קיר להמתין אחרי שהסיבוב נעצר עד שהתמונה נחשבת יציבה שוב
+// הזמן לבדו לא מספיק: קישור ה-RF מספק רק ~1-3 פריימים טריים בשנייה, ואחרי סיבוב
+// (שמנקה את radarMemory בחומרה אמיתית) 1400ms מביאים רק ~1-4 צעדי-סריקה — התמונה
+// עדיין כמעט ריקה. לכן דורשים גם מספר מינימלי של פריימי-טלמטריה טריים שהצטברו מאז
+// שהסיבוב נעצר, כך שהמתנה ב-קישור איטי מתארכת דה-פקטו עד שיש באמת מספיק נתונים
+// לבנות תמונה. בקישור מהיר זה כמעט שקוף (הפריימים מגיעים מהר).
+const RADAR_SETTLE_MIN_FRAMES = 5;  // מס' פריימי-טלמטריה טריים מינימלי אחרי סיבוב לפני שהתמונה נחשבת יציבה
+
 // --- אינטרפולציה ליניארית פר-צד --------------------------------------------------
 // האולטרה-סוניק גס: קיר ישר יוצא כנקודות מפוזרות/קו עקום. כל חיישן (חזית/ימין/
 // אחור/שמאל) סורק קשת ~75° משלו, ולכן מעבדים כל צד בנפרד: מתאימים קו ישר יחיד
@@ -296,7 +336,23 @@ const RADAR_FREEZE_AFTER_MS = 1500;
 // של החומרה מדלגת על סלוט בודד, מוצג קו מלא ורציף במקום נקודות מנצנצות.
 const RADAR_FIT_MIN_POINTS = 3;          // צריך לפחות 3 נקודות כדי להצדיק קו
 const RADAR_FIT_MAX_RESIDUAL_CM = 25;    // אם הפיזור סביב הקו גדול מזה — לא קיר, לא מציירים
+// דחיית "טבעת"-רפאים: קיר שטוח אמיתי שנסרק על פני קשת רחבה מראה טווח שגדל לעבר
+// הקצוות (∝1/cos מהניצב). הד-רפאים (מים/קרקע/cross-talk) מחזיר טווח כמעט-קבוע בכל
+// הכיוונים, וקשת בטווח קבוע מתאימה לקו בשיורי נמוך — ולכן עוברת את בדיקת השיורי.
+// לכן: אם צד נפרס על קשת רחבה מ-RADAR_RING_ANG_MIN_DEG אך הטווח בקצוות אינו רחוק
+// מהמרכז לפחות פי RADAR_RING_EDGE_RATIO — זו טבעת-רפאים, לא קיר. ראה isPhantomRing.
+const RADAR_RING_ANG_MIN_DEG = 45;       // מפעילים את הבדיקה רק על קשת רחבה
+const RADAR_RING_EDGE_RATIO = 1.12;      // קיר אמיתי ב-45°+: קצה רחוק מהמרכז לפחות פי זה
 const WALL_TTL_MS = 10000;               // קטע-קיר מיושר נשמר עד שהסריקה האיטית תחזור לרעננו, כדי שלא ינצנץ
+// חיבור קצות-קירות: אם הפער בין קצה של קיר אחד לקצה של קיר אחר קטן מזה, הם
+// "נפגשים". הקירות מיושרים למסגרת-רשת משותפת {φ, φ+90°}, ולכן זוג קירות הוא תמיד
+// מקביל (מתמזג לקו ישר, ~180°) או ניצב (נפגש בפינה, ~90°). ראה joinNearbyWalls.
+const WALL_JOIN_GAP_CM = 30;
+// פינה = שני קירות ניצבים (במסגרת-הרשת). קצוותיהם ליד הפינה נמדדים בדלילות ולכן
+// עשויים להישאר עם פער קטן, ואז מאריכים אותם עד נקודת-החיתוך כדי שייפגשו לפינה
+// נקייה. אבל אסור לחבר קווים שרחוקים זה מזה: פער גדול הוא מעבר/פתח אמיתי במסלול,
+// לא פינה. לכן מגבילים את טווח-ההגעה ל-40 ס"מ — מעל זה לעולם לא מחברים.
+const RADAR_CORNER_REACH_CM = 40;
 // המכ"ם סורק 0..90° ומגלגל את כל 4 החיישנים יחד. אמצע-הסריקה (45°) מיושר עם החרטום,
 // ולכן בצג מסובבים את התמונה ב-SWEEP_CENTER_DEG כדי שהחיישן הקדמי (הירוק) יהיה
 // למעלה ויסרוק ימינה-שמאלה סימטרית סביב החרטום, ושאר החיישנים בהתאמה.
@@ -401,18 +457,33 @@ if (downloadNavBtn) {
   });
 }
 
-setupJoystick();
-setupWinchJoystick();
-initTransport();
-requestAnimationFrame(drawRadar);
-requestAnimationFrame(drawWorld);
-requestAnimationFrame(drawMap);
+if (replayRefreshBtn) replayRefreshBtn.addEventListener("click", loadReplayLogList);
+if (replayPlayBtn) {
+  replayPlayBtn.addEventListener("click", () => startReplay(replaySelect ? replaySelect.value : ""));
+}
+if (replayStopBtn) {
+  replayStopBtn.addEventListener("click", () => {
+    stopReplay();
+    setServerMessage("ניגון הופסק.", false);
+  });
+}
 
 // SERVERLESS = the page is served as a static site (GitHub Pages / opened
 // directly) with no control_server.py behind it. In that mode every /api/*
 // call and the telemetry stream are served locally by LocalBridge, which talks
 // to the shore Arduino over the Web Serial API (USB-OTG on Android Chrome).
+// Declared BEFORE loadReplayLogList() runs so that call doesn't read it in the
+// temporal dead zone (was throwing a ReferenceError at load).
 let SERVERLESS = false;
+
+setupJoystick();
+setupWinchJoystick();
+initTransport();
+updateReplayUI();
+loadReplayLogList();
+requestAnimationFrame(drawRadar);
+requestAnimationFrame(drawWorld);
+requestAnimationFrame(drawMap);
 
 async function detectServerMode() {
   try {
@@ -615,32 +686,53 @@ function startCommandLoop() {
     if ((!state.connected && !state.mockEnabled) || state.sendingCommand) {
       return;
     }
-    if (!state.manualMode) {
-      updateAutonomousCommand();
-    }
-    // Advance the sweep once every RADAR_STEP_EVERY_TICKS *sent* commands rather
-    // than by wall-clock. The old Date.now() gate fired on whichever loop tick
-    // first crossed the threshold; because the loop skips ticks while a previous
-    // send is still in flight (state.sendingCommand) and 300ms/400ms don't
-    // divide evenly, the step landed on uneven 300/600ms+ gaps — the visible
-    // jump in rotation. Counting actual sends keeps the angular rate constant
-    // and locked to the data cadence (one fresh angle per sample).
-    state.radarStepTick += 1;
-    if (state.radarStepTick >= RADAR_STEP_EVERY_TICKS) {
-      advanceRadarSweep();
-      state.radarStepTick = 0;
-    }
 
-    // === יירוט ודריסת פקודות היגוי לצורך בטיחות ===
-    // הדריסה מחושבת על עותק בלבד, כך שברגע שיוצאים מהטווח הכתום
-    // השליטה חוזרת מיד לניווט האוטונומי/השליטה הידנית.
-    const outgoing = computeSafeCommand();
+    let outgoing;
+    if (state.replay.active) {
+      // ניגון חוזר: הפקודות נלקחות מהמסלול המוקלט לפי התזמון המקורי (ולא
+      // מהג'ויסטיק/הניווט). כך הסירה מבצעת פיזית מחדש את הנסיעה שהוקלטה.
+      outgoing = replayStep();
+    } else {
+      if (!state.manualMode) {
+        updateAutonomousCommand();
+      }
+      // Advance the sweep once every RADAR_STEP_EVERY_TICKS *sent* commands
+      // rather than by wall-clock. The old Date.now() gate fired on whichever
+      // loop tick first crossed the threshold; because the loop skips ticks
+      // while a previous send is still in flight (state.sendingCommand) and
+      // 300ms/400ms don't divide evenly, the step landed on uneven 300/600ms+
+      // gaps — the visible jump in rotation. Counting actual sends keeps the
+      // angular rate constant and locked to the data cadence.
+      state.radarStepTick += 1;
+      if (state.radarStepTick >= RADAR_STEP_EVERY_TICKS) {
+        advanceRadarSweep();
+        state.radarStepTick = 0;
+      }
+
+      // === יירוט ודריסת פקודות היגוי לצורך בטיחות ===
+      // הדריסה מחושבת על עותק בלבד, כך שברגע שיוצאים מהטווח הכתום
+      // השליטה חוזרת מיד לניווט האוטונומי/השליטה הידנית.
+      outgoing = computeSafeCommand();
+    }
     // מצב ההפעלה (0=ידני, 1=אוטומטי) נשלח עם כל פקודה; הסירה מציגה צבע לפיו
-    // ומעדכנת את הלד רק כשהערך משתנה (כך לא משבשים את קליטת ה-RF).
-    outgoing.mode = state.manualMode ? 0 : 1;
+    // ומעדכנת את הלד רק כשהערך משתנה (כך לא משבשים את קליטת ה-RF). בניגון
+    // חוזר שולחים 0 (ידני) כדי שהסירה לא תריץ ניווט-על עצמאי מעל המסלול.
+    outgoing.mode = (state.manualMode || state.replay.active) ? 0 : 1;
 
-    // Record the full I/O + decision of this autonomous tick for later analysis.
-    if (!state.manualMode) recordNavTick(outgoing);
+    // הקלטה רציפה: כל עוד מחוברים (ולא מנגנים מסלול קיים) רושמים כל טיק — ידני
+    // או אוטונומי — כדי שאפשר יהיה לנתח ולנגן מחדש את כל הנסיעה. סשן חדש (קובץ
+    // חדש) נפתח אוטומטית בתחילת ההקלטה, ונסגר (flush) כשמתנתקים/מתחילים ניגון.
+    const shouldRecord = (state.connected || state.mockEnabled) && !state.replay.active;
+    if (shouldRecord) {
+      if (!navSessionStarted) {
+        startNavLogSession();
+        navSessionStarted = true;
+      }
+      recordNavTick(outgoing);
+    } else if (navSessionStarted) {
+      flushNavLog();
+      navSessionStarted = false;
+    }
 
     // אודומטריה: מקדמים את אומדן הפוזה לפי הפקודה הנשלחת, כך שהתפיסה+הניווט
     // רצים על פוזה משוערת (ריאל-טרנספרבילית) ולא על אמת-שרת שקיימת רק בסימולטור.
@@ -666,19 +758,24 @@ function stopCommandLoop() {
   }
 }
 
-// --- Autonomous-run recorder ------------------------------------------------
-// Captures, once per autonomous tick, what the boat SENT (telemetry/sensors),
-// what it RECEIVES (the motor command), and what the navigator PERCEIVED and
-// DECIDED (bow offset, phase, bow-relative cones, chosen escape bearing). The
-// records are batched to /api/navlog so a run is saved to disk for later
-// analysis even if the phone/browser is closed. Nothing is logged in manual
-// mode or when idle/disconnected.
+// --- Drive recorder (teach-and-repeat) --------------------------------------
+// Captures, once per control tick, what the boat SENT (telemetry/sensors), what
+// it RECEIVES (motor + winch command), and — in autonomous mode — what the
+// navigator perceived/decided. Recording runs CONTINUOUSLY while connected (in
+// BOTH manual and autonomous mode) so a whole sail can be analysed AND played
+// back later. Records are batched to /api/navlog so the run is saved to disk
+// even if the phone/browser closes. Nothing is logged while idle/disconnected
+// or while a previously-recorded route is being replayed.
 const navLogPending = [];
 let navLogFlushing = false;
 let navLogResetPending = false;
+// True once a recording session (one log file) has been opened for the current
+// connection; reset when we disconnect or start a replay so the next connection
+// rotates to a fresh file.
+let navSessionStarted = false;
 
 function startNavLogSession() {
-  // Rotate to a fresh log file on the next flush (new experiment = new file).
+  // Rotate to a fresh log file on the next flush (new run = new file).
   navLogPending.length = 0;
   navLogResetPending = true;
   flushNavLog();
@@ -693,6 +790,8 @@ function recordNavTick(outgoing) {
   navLogPending.push({
     t: Date.now(),
     mock: state.mockEnabled,
+    manual: state.manualMode,
+    mode: state.manualMode ? "manual" : "auto",
     phase: state.nav.rwPhase,
     bowOffsetDeg: Math.round((state.nav.bowOffsetDeg ?? 0) * 10) / 10,
     bowLocked: !!state.nav.bowLocked,
@@ -708,10 +807,12 @@ function recordNavTick(outgoing) {
       boatHeadingDeg: t.boatHeadingDeg ?? null,
       stale: t.stale ?? null,
     },
-    // What the boat RECEIVES (the motor/servo command we are about to send).
+    // What the boat RECEIVES (the motor/winch/servo command we send). This is
+    // the exact stream replayed to physically re-drive the recorded route.
     cmd: {
       left: outgoing.leftSpeed,
       right: outgoing.rightSpeed,
+      winch: outgoing.winchSpeed ?? 0,
       radarAngle: outgoing.radarAngle,
     },
     // What the navigator PERCEIVED (bow-relative, 1 m-capped) and its decision.
@@ -750,6 +851,171 @@ window.addEventListener("beforeunload", flushNavLog);
 window.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") flushNavLog();
 });
+
+
+// --- Replay (teach-and-repeat playback) -------------------------------------
+// Physically re-drive a recorded route: the command loop pulls the recorded
+// motor/winch/servo commands from the log and re-sends them at their original
+// relative timing, so the boat repeats the movements it was taught. This is the
+// foundation for future autonomous route-following (the recorded path becomes a
+// reference the navigator can track).
+function replayZeroCmd() {
+  return {
+    leftSpeed: 0,
+    rightSpeed: 0,
+    winchSpeed: 0,
+    radarAngle: state.cmd.radarAngle,
+  };
+}
+
+// Fetch the list of recorded runs from the server and fill the replay picker.
+async function loadReplayLogList() {
+  if (SERVERLESS || !replaySelect) return;
+  try {
+    const data = await getJson("/api/logs");
+    const logs = Array.isArray(data.logs) ? data.logs : [];
+    const prev = replaySelect.value;
+    replaySelect.innerHTML = "";
+    if (!logs.length) {
+      const o = document.createElement("option");
+      o.value = "";
+      o.textContent = "אין מסלולים מוקלטים";
+      replaySelect.appendChild(o);
+    } else {
+      for (const lg of logs) {
+        const o = document.createElement("option");
+        o.value = lg.name;
+        o.textContent = `${lg.name} · ${lg.records} רשומות`;
+        replaySelect.appendChild(o);
+      }
+      if (prev && logs.some((l) => l.name === prev)) replaySelect.value = prev;
+    }
+  } catch (err) {
+    // Non-fatal: leave the picker as-is.
+  }
+}
+
+// Load a recorded run and begin physically replaying its command stream.
+async function startReplay(name) {
+  if (!name) {
+    setServerMessage("בחר מסלול מוקלט לניגון.", true);
+    return;
+  }
+  if (SERVERLESS) {
+    setServerMessage("ניגון מסלול זמין רק דרך שרת השליטה המקומי.", true);
+    return;
+  }
+  if (state.replay.active) stopReplay();
+
+  let text;
+  try {
+    const resp = await fetch(`/api/logs/${encodeURIComponent(name)}`, { cache: "no-store" });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    text = await resp.text();
+  } catch (err) {
+    setServerMessage(`טעינת המסלול נכשלה: ${err.message}`, true);
+    return;
+  }
+
+  const records = [];
+  for (const line of text.split("\n")) {
+    const s = line.trim();
+    if (!s) continue;
+    try {
+      const rec = JSON.parse(s);
+      if (rec && rec.cmd && typeof rec.t === "number") records.push(rec);
+    } catch (err) {
+      // Skip a malformed line rather than aborting the whole route.
+    }
+  }
+  if (records.length < 2) {
+    setServerMessage("המסלול המוקלט ריק או קצר מדי לניגון.", true);
+    return;
+  }
+
+  // Manual mode so neither the joystick nor the autonomous navigator fights the
+  // replayed command stream.
+  if (!state.manualMode) {
+    modeSwitch.checked = false;
+    onModeChange();
+  }
+
+  state.replay.active = true;
+  state.replay.records = records;
+  state.replay.index = 0;
+  state.replay.baseT = records[0].t;
+  state.replay.startWallT = performance.now();
+  state.replay.name = name;
+  state.replay.loop = replayLoopChk ? replayLoopChk.checked : false;
+  updateReplayUI();
+  setServerMessage(`מנגן מסלול: ${name} (${records.length} רשומות).`, false);
+}
+
+// Step the replay: return the command that matches the elapsed play time. Ends
+// (or loops) once the last recorded frame's time has passed.
+function replayStep() {
+  const r = state.replay;
+  const recs = r.records;
+  if (!recs.length) {
+    stopReplay();
+    return replayZeroCmd();
+  }
+  const elapsed = performance.now() - r.startWallT;
+  const endOffset = recs[recs.length - 1].t - r.baseT;
+
+  // Advance to the latest record whose original offset has been reached.
+  while (r.index < recs.length - 1 && recs[r.index + 1].t - r.baseT <= elapsed) {
+    r.index += 1;
+  }
+
+  // Past the end of the route.
+  if (elapsed > endOffset + CONTROL_INTERVAL_MS) {
+    if (r.loop) {
+      r.index = 0;
+      r.startWallT = performance.now();
+    } else {
+      stopReplay();
+      setServerMessage(`ניגון הסתיים: ${r.name}.`, false);
+      return replayZeroCmd();
+    }
+  }
+
+  const c = recs[r.index].cmd || {};
+  updateReplayStatus(elapsed, endOffset);
+  return {
+    leftSpeed: c.left ?? 0,
+    rightSpeed: c.right ?? 0,
+    winchSpeed: c.winch ?? 0,
+    radarAngle: c.radarAngle ?? state.cmd.radarAngle,
+  };
+}
+
+function stopReplay() {
+  if (!state.replay.active) return;
+  state.replay.active = false;
+  // Leave the boat stopped after playback.
+  state.cmd.leftSpeed = 0;
+  state.cmd.rightSpeed = 0;
+  state.cmd.winchSpeed = 0;
+  updateReplayUI();
+}
+
+function updateReplayStatus(elapsed, endOffset) {
+  if (!replayStatus) return;
+  const secs = (ms) => (Math.max(0, ms) / 1000).toFixed(1);
+  const r = state.replay;
+  replayStatus.textContent =
+    `מנגן ${r.name} · ${r.index + 1}/${r.records.length} · ${secs(elapsed)}/${secs(endOffset)} ש'`;
+}
+
+function updateReplayUI() {
+  const active = state.replay.active;
+  if (replayPlayBtn) replayPlayBtn.disabled = active;
+  if (replayStopBtn) replayStopBtn.disabled = !active;
+  if (replaySelect) replaySelect.disabled = active;
+  if (replayRefreshBtn) replayRefreshBtn.disabled = active;
+  if (replayStatus && !active) replayStatus.textContent = "לא מנגן";
+}
 
 
 async function refreshPorts() {
@@ -891,6 +1157,12 @@ function applyRemoteState(remoteState, syncCmd = false) {
     // updateRadarWalls דורס את הבינים שנפלו על קו-קיר בטווח המיושר. כך הניווט
     // האוטונומי (liveCone) באמת מסתמך על האינטרפולציה, לא רק הצג.
     updateRadarWalls();
+    // ואז מכיילים מול הידע הפיזי על המסלול: מסלקים "מסדרונות" צרים מ-MIN_CORRIDOR_CM
+    // שלא ייתכנו במציאות (הד/רפאים) מתוך סריקת-הניווט, אחרי שהיא כבר הורכבה במלואה.
+    applyMinCorridorPrior();
+    // ובאותה רוח: המסלול לעולם אינו "קופסה סגורה" — תמיד יש צד פתוח. אם כל ארבעת
+    // הכיוונים נראים חסומים, פותחים את החלש (הרחוק) שבהם כדי שתמיד יהיה מוצא.
+    applyNoClosedBoxPrior();
   } else {
     // Comms lost / not connected: keep the LAST radar picture (radarMemory +
     // radarWalls) on screen instead of wiping it, so the operator still sees
@@ -974,13 +1246,20 @@ function onModeChange() {
     // Real-world autonomous restarts with a fresh online bow estimate + scan.
     if (!state.mockEnabled) {
       state.nav.bowOffsetDeg = BOW_SERVO_OFFSET_DEG;
-      state.nav.bowLocked = false;
+      state.nav.bowLocked = BOW_FIXED;
       state.nav.rwPhase = "calib";
       state.nav.calibActive = true;
       state.nav.calibStart = performance.now();
       state.nav.spinUntil = 0;
+      state.nav.spinDir = 0;
       state.nav.settleUntil = 0;
+      state.nav.wallEscapeUntil = 0;
+      state.nav.wallEscapeSide = 0;
       state.nav.reverseUntil = 0;
+      state.nav.reverseArcDir = 0;
+      state.nav.sideUntil = 0;
+      state.nav.sideDir = 0;
+      state.nav.fwdUntil = 0;
       // Coarse travel direction: heading 0 = "the way the bow points now", which
       // the operator aims at the goal/channel entrance before arming autonomy.
       state.pose.x = 0;
@@ -997,8 +1276,8 @@ function onModeChange() {
       bowStableHits = 0;
       resetRadarWalls();
     }
-    // Begin a fresh run recording (new log file) whenever autonomy arms.
-    startNavLogSession();
+    // ההקלטה רציפה לאורך כל החיבור (ידני+אוטונומי), כך שהחלפת מצב לא מפצלת
+    // את הקובץ. לא פותחים סשן חדש כאן — הלולאה מנהלת אותו לפי מצב החיבור.
   } else {
     // Autonomy disarmed: push the tail of the run to disk.
     flushNavLog();
@@ -1220,13 +1499,9 @@ function integratePose(cmd, dtSec) {
   const rightDir = Math.sign(shapeMotorSpeed(cmd.rightSpeed));
   // רמת הכוח האפקטיבית המשותפת (שבר מהסולם 0..255). שתי מהירויות הכיול מושוות
   // בפועל, לכן משתמשים בממוצע כעוצמת דחף אחידה לשני המנועים — זהה ל-_mock_loop.
-  const motorLevel = ((state.motorLeftAbs ?? 90) + (state.motorRightAbs ?? 80)) / 2 / 255;
+  const motorLevel = ((state.motorLeftAbs ?? 84) + (state.motorRightAbs ?? 88)) / 2 / 255;
   const throttle = (leftDir + rightDir) / 2 * motorLevel;
-  const turn = (rightDir - leftDir) / 2 * motorLevel וגם אוטונומי מוגבלים לאותה רצועת כוח.
-  const left = shapeMotorSpeed(cmd.leftSpeed);
-  const right = shapeMotorSpeed(cmd.rightSpeed);
-  const throttle = (left + right) / (2 * 255);
-  const turn = (right - left) / (2 * 255);
+  const turn = (rightDir - leftDir) / 2 * motorLevel;
   const thrust = throttle * DR_MAX_SPEED_CMS * DR_LINEAR_DRAG;
   const targetTurnRate = turn * DR_TURN_RATE;
   const HX = world.boundsHalfX || 600;
@@ -1234,6 +1509,7 @@ function integratePose(cmd, dtSec) {
   // תת-צעד ב-50ms בדיוק כמו השרת, כך שאינטגרציית אוילר של הלקוח מתקדמת צעד-בצעד
   // עם _mock_loop (אותה צבירת כיוון+מיקום) ולא נפער פער כיוון בטיקים ארוכים.
   const SERVER_STEP_SEC = 0.05;
+  let dt = dtSec;
   while (dt > 1e-6) {
     const h = Math.min(SERVER_STEP_SEC, dt);
     // תנע קווי: דחף מנוגד לגרר מים לינארי — הכלי מחליק אחרי ניתוק המצערת.
@@ -1517,6 +1793,16 @@ function updateEscapeManeuver() {
 // learned online, during motion, every trip (see the estimator in
 // updateLiveScan) and stored in state.nav.bowOffsetDeg.
 const BOW_SERVO_OFFSET_DEG = 60;
+// The bow offset is now FIXED (user calibrated the servo perpendicular to the
+// pool wall => bow at servo 60°). The online estimator wandered/locked onto
+// wrong values in the enclosed pool, so it is DISABLED: bowOffsetDeg stays
+// pinned at BOW_SERVO_OFFSET_DEG. Set false to re-enable online bow learning.
+const BOW_FIXED = true;
+// usFront water-surface reflection band: readings in [MIN,MAX] are the phantom
+// return off the water (~constant regardless of the real distance) and are
+// treated as OPEN water for navigation. Tune to match the observed water value.
+const FRONT_WATER_MIN_CM = 38;
+const FRONT_WATER_MAX_CM = 60;
 // The radar array is a ROTATING quarter-sweep (servo 0..90 in 15 deg steps, one
 // step per telemetry frame ~350ms), so any given bow-relative bearing is only
 // re-sampled about once every ~6 steps ~ 2-3s (worse when the RF link stalls).
@@ -1529,12 +1815,15 @@ const LIVE_SCAN_TTL_MS = 4000;   // a bearing bin is trusted only if refreshed t
 const LIVE_BIN_DEG = 15;         // bin width ~ sensor field of view
 const RW_CRUISE = 82;            // gentle forward (real momentum + noise tolerance)
 const RW_REVERSE = 80;           // backing-out magnitude when blocked / boxed in
-const RW_FRONT_CONE_DEG = 22;    // half-cone treated as "dead ahead"
+const RW_FRONT_CONE_DEG = 50;    // half-cone treated as "ahead". WIDE on purpose: the online bow estimate is unreliable in the enclosed pool (wanders 54-81°), so a head-on wall can land up to ~45° off the estimated bow. A wide cone catches it despite that error (root cause of the head-on collisions). The block decision uses the cone MIN (nearest), not the median, so one close wall can't be outvoted by open readings beside it.
 const RW_SIDE_BEARING_DEG = 55;  // bearing where we probe for the escape side
 const RW_SIDE_TOL_DEG = 40;
-const RW_BLOCK_CM = 45;          // front closer than this -> back off (reverse burst)
-const RW_EMERGENCY_CM = 24;      // hard stop -> reverse away, regardless of intent
-const RW_ARC_DEG = 70;           // forward hemisphere scanned for a gap to steer into
+// המכ"ם הסורב מרענן כיוון נתון רק כל ~2 ש'; במהירות המים הסירה עוברת עד ~30 ס"מ
+// בין ריענון לריענון. לכן ספי-החזית מוגדלים כדי שההחלטה לעצור/לפנות תיפול בעודה
+// רחוקה מספיק — גם אם הגוף "התקרב" 30 ס"מ מאז המדידה האחרונה.
+const RW_BLOCK_CM = 50;          // front closer than this -> reverse. Set BELOW the usFront water-reflection band (~56cm min) so open water never false-blocks, while a real near wall (reported as the nearer echo) does. Front cone uses the MEDIAN so a lone wave dip won't trip it.
+const RW_EMERGENCY_CM = 32;      // hard stop -> reverse away, regardless of intent (was 24)
+const RW_SIDE_DANGER_CM = 22;    // side wall closer than this -> immediate turn AWAY from itconst RW_ARC_DEG = 70;           // forward hemisphere scanned for a gap to steer into
 // Turning is never the default: within this heading error the boat drives dead
 // straight; only a gap notably off to a side eases the inner motor into a
 // forward ARC (turn WHILE advancing), so it only ever turns in order to travel.
@@ -1542,12 +1831,20 @@ const RW_ARC_DEADBAND_DEG = 20;
 const RW_SIDE_TIE_CM = 15;       // |left-right| below this is a tie -> break toward goal
 // --- Wave/wind robustness (self-refining, no hardcoded environment size) ---
 const RW_MAX_RANGE = 300;        // "no echo" (open water) is stored as this range
+// Physical prior about THIS course: no two SEPARATE (unconnected) parallel walls
+// are ever closer than this. So an opposing pair of returns whose ranges sum to
+// less than this describes a corridor that cannot exist -> one of them is a
+// ghost/echo, and applyMinCorridorPrior() calibrates it out of the live scan.
+const MIN_CORRIDOR_CM = 75;
+// The course is never a closed box (always an open way in/out). A cardinal side
+// counts as "walled" for that test when its clearance is below this.
+const CLOSED_BOX_WALL_CM = 60;
 // Navigation reacts ONLY to obstacles inside this range. Anything farther is
 // noisy and irrelevant to a decision, so every clearance is capped here: all
 // bearings >= 1 m read as equally "open", and steering is driven purely by the
 // sub-metre returns. Differences BELOW the cap (i.e. real nearby obstacles) are
 // preserved, so "aim at the farthest direction" still works when boxed in.
-const RW_DECISION_RANGE_CM = 100;
+const RW_DECISION_RANGE_CM = 200;
 const RW_OPEN_FRAC = 0.55;       // open gap = clearance >= this fraction of the deepest in view
 const RW_OPEN_MIN_CM = 45;       // floor for the adaptive open threshold (small pools)
 const RW_SPIKE_RATE_CM_S = 130;  // implied closing speed above this = wave spike, never votes
@@ -1621,12 +1918,26 @@ function updateLiveScan() {
   const forwardMotion =
     L > 0 && R > 0 && L + R >= RW_FWD_EST_NET && Math.abs(L - R) <= RW_FWD_EST_DIFF;
   for (const beam of SENSOR_BEAMS) {
+    // NOTE: usFront is fed to nav (NOT skipped here). Its fault is a ~65cm water
+    // reflection when the bow is OPEN, but ultrasonic reports the NEAREST echo,
+    // so a real wall CLOSER than ~65cm is reported correctly. RW_BLOCK_CM is set
+    // below the water-reflection band so open water never false-blocks, while a
+    // genuine near wall ahead still triggers the reverse. (It IS skipped in the
+    // DISPLAY loops via MASK_FRONT_DISPLAY so the open-water reflection doesn't
+    // draw a phantom wall on the radar picture.)
     const raw = state.telemetry[beam.key];
     if (raw == null || raw < 0) continue; // no data / invalid this beam
+    // FILTER the usFront water-surface reflection: it reports a roughly-constant
+    // ~38-60cm regardless of the real distance ahead. Treat readings inside that
+    // band as OPEN water (no echo) so the phantom "wall" never blocks navigation.
+    // A genuinely close wall reads BELOW the band (nearest echo) and still
+    // triggers the reactions; anything beyond the band is real too.
+    const isFrontWater =
+      beam.key === "usFront" && raw >= FRONT_WATER_MIN_CM && raw <= FRONT_WATER_MAX_CM;
     // "No echo" (0/999) is real information: open water at max range. Storing it
     // (instead of skipping) lets freshness detection work AND lets a momentary
     // wave DROPOUT be seen as "open at max" rather than an unknown/stale gap.
-    const measured = raw === 0 || raw >= 999 ? RW_MAX_RANGE : raw;
+    const measured = raw === 0 || raw >= 999 || isFrontWater ? RW_MAX_RANGE : raw;
     const rawBearing = normalizeDeg(beam.dir + servo); // sensor-mount + servo (raw frame)
     const bowRel = binBearing(rawBearing - bowOff);    // 0 = bow (current estimate)
     liveScan.set(bowRel, { dist: measured, t: now });
@@ -1682,7 +1993,7 @@ function updateLiveScan() {
       bowCandidateDeg == null
         ? estDeg
         : normalizeDeg(bowCandidateDeg + wrap180(estDeg - bowCandidateDeg) * 0.3);
-    if (bowStableHits >= BOW_EST_STABLE_HITS) {
+    if (bowStableHits >= BOW_EST_STABLE_HITS && !BOW_FIXED) {
       state.nav.bowOffsetDeg = bowCandidateDeg;
       state.nav.bowLocked = true;
     }
@@ -1690,6 +2001,73 @@ function updateLiveScan() {
     // Evidence faded below the gate — decay the streak so a later burst must
     // re-establish stability rather than resume an old count.
     bowStableHits = Math.max(0, bowStableHits - 1);
+  }
+}
+
+// Calibrate the live scan against the course prior in MIN_CORRIDOR_CM: no two
+// SEPARATE parallel walls in this course are closer than that. So whenever a
+// return on some bearing and an OPPOSING return (~180° away) sum to less than
+// MIN_CORRIDOR_CM, that pair describes a physically impossible narrow corridor —
+// one of the two is a ghost (multipath/echo). Ultrasonic ghosts are the weaker,
+// FARTHER return (the extra bounce adds path length), while the nearest echo is
+// the true nearest surface, so we KEEP the nearer wall and open the farther bin
+// back up to max range. This scrubs phantom narrow corridors out of the scan the
+// navigator reads, so a wall that isn't there can't make the boat brake/turn.
+//
+// SAFETY: we never open a bin in the FORWARD cone (|bin| <= RW_FRONT_CONE_DEG).
+// Blinding ourselves straight ahead is the one unacceptable failure, so if the
+// bin we would open faces forward we leave the pair untouched (stay conservative)
+// and rely on the reverse/turn logic instead.
+function applyMinCorridorPrior() {
+  const now = performance.now();
+  const done = new Set();
+  for (const [bin, e] of liveScan) {
+    if (done.has(bin)) continue;
+    if (now - e.t > LIVE_SCAN_TTL_MS || e.dist >= RW_MAX_RANGE) continue;
+    const opp = wrap180(bin + 180);
+    const o = liveScan.get(opp);
+    done.add(bin);
+    if (!o) continue;
+    done.add(opp);
+    if (now - o.t > LIVE_SCAN_TTL_MS || o.dist >= RW_MAX_RANGE) continue;
+    if (e.dist + o.dist >= MIN_CORRIDOR_CM) continue; // corridor is physically possible
+    // Impossible corridor: keep the nearer (real) wall, open the farther (ghost).
+    const farBin = e.dist <= o.dist ? opp : bin;
+    if (Math.abs(farBin) <= RW_FRONT_CONE_DEG) continue; // never blind the bow
+    liveScan.set(farBin, { dist: RW_MAX_RANGE, t: now });
+  }
+}
+
+// Calibrate against the course prior that it NEVER forms a closed box: there is
+// always at least one open side (the way in / the way out) — walls run as
+// continuous lines out to sensor range or until they meet another wall at a 90°
+// corner, but they never seal the boat in on all four sides. So if all FOUR
+// cardinal directions (front, right, rear, left) read a wall within
+// CLOSED_BOX_WALL_CM, the picture is physically impossible: the weakest (FARTHEST)
+// of the four is the most likely ghost, so we open it back up to max range. This
+// gives the navigator a real escape instead of the false "boxed-in" that makes it
+// stall/reverse for a wall that isn't there.
+//
+// SAFETY: never open the FORWARD cone. If the farthest happens to be dead ahead
+// we open the next-farthest non-forward cardinal instead, so we never blind the
+// bow — a real wall astern/beside us is re-checked the moment we move toward it.
+function applyNoClosedBoxPrior() {
+  const now = performance.now();
+  const reads = [0, 90, 180, -90].map((d) => {
+    const c = liveCone(d, RW_WALL_TOL_DEG);
+    return { d, dist: c.count ? c.median : RW_MAX_RANGE };
+  });
+  if (!reads.every((r) => r.dist < CLOSED_BOX_WALL_CM)) return; // not a closed box
+  const openable = reads
+    .filter((r) => Math.abs(r.d) > RW_FRONT_CONE_DEG) // never the bow
+    .sort((a, b) => b.dist - a.dist); // farthest (weakest) first
+  if (!openable.length) return;
+  const target = openable[0].d;
+  for (const [bin, e] of liveScan) {
+    if (now - e.t > LIVE_SCAN_TTL_MS) continue;
+    if (Math.abs(wrap180(bin - target)) <= RW_WALL_TOL_DEG) {
+      liveScan.set(bin, { dist: RW_MAX_RANGE, t: now });
+    }
   }
 }
 
@@ -1737,45 +2115,95 @@ function bestOpenBearing(loB, hiB) {
   return { bearing: bestB, clear: best, count };
 }
 
-// --- Left-wall following (35 cm) — the guiding autonomous logic ---
-const RW_WALL_TARGET_CM = 35;     // מרחק המטרה מהדופן השמאלית
-const RW_WALL_BAND_CM = 10;       // רוחב היסטרזיס סביב המטרה (± ס"מ)
-const RW_WALL_BEARING_DEG = -90;  // הדופן השמאלית במסגרת-חרטום (שלילי = שמאל)
-const RW_WALL_TOL_DEG = 30;       // סובלנות זוויתית לחרוט הצד השמאלי
+// --- Wall AVOIDANCE (stay OFF the walls, roam the open middle) --------------
+// Replaces the old left-wall FOLLOWING. React when ANY wall is within the buffer
+// and steer AWAY from it toward the more-open side. The buffer is deliberately
+// large so the boat keeps a comfortable margin from walls instead of hugging.
+const RW_KEEPAWAY_CM = 55;         // side wall within this -> turn away toward open water
+const RW_KEEPAWAY_CLEAR_CM = 75;   // after turning away, drive straight until the near side recovers to this
+const RW_WALL_TOL_DEG = 30;       // סובלנות זוויתית לחישת דופן צד
+// אחרי שכיוונּו את החרטום הרחק מקיר קרוב, מחויבים לנסיעה-ישר קדימה עד שהמרווח
+// חוזר ליעד — כדי *להתרחק בפועל* (תזוזה), במקום עוד סיבוב-במקום שרק מנדנד. חלון
+// זמן מקסימלי כבטיחות; בפועל הבריחה מסתיימת מוקדם ברגע שהמרווח התאושש.
+const RW_WALL_ESCAPE_MS = 2500;
 // נסיעה-לאחור מחויבת כ"פרץ" בעל משך מינימלי, לא נדנוד של טיק בודד. בקצב-קישור
 // איטי ורועש קריאת-החזית מתנדנדת סביב סף הנסיעה-לאחור, וכל טיק שמחליט מחדש
 // לאחור/קדימה גורם לסירה לנוע קדימה-אחורה במקום בלי להתקדם. פרץ מחויב נסוג מרחק
 // אמיתי, ואז ההערכה הבאה מוצאת מקום להסתובב לעבר הפתח ולצאת.
 const RW_REVERSE_BURST_MS = 800;
-
-// Reversing ARC used to back off a blocked bow. The motors are 3-state (0/±80),
-// so a symmetric spin (80/-80) has ZERO net translation — it just rotates on
-// the spot, which is exactly what we DON'T want. A single reversed motor both
-// TRAVELS (backward) and swings the bow toward the open side, so the boat only
-// ever turns as part of real motion. Boxed in on both quarters -> straight back
-// out to gain room. (turn = right-left: openDir>0 wants the bow to swing right,
-// which needs turn>0, i.e. left backs while right idles.)
-function reverseArcCmd(openDir, boxed) {
-  if (boxed) return { left: -RW_REVERSE, right: -RW_REVERSE };
-  return openDir > 0
-    ? { left: -RW_REVERSE, right: 0 }
-    : { left: 0, right: -RW_REVERSE };
+// פרץ סיבוב-במקום מחויב: קצר בכוונה (~צעד בודד ≈ טיק אחד ב-CONTROL_INTERVAL_MS).
+// אחרי כל פרץ הסירה נעצרת וממתינה שהמכ"ם יתרענן לפני שתסתובב שוב, כדי לא לפנות
+// לתוך גוף שטרם נסרק מחדש. סיבוב-במקום מועדף על קשת כי טביעת-הרגל מזערית.
+const RW_SPIN_BURST_MS = 250;
+// סיבוב-במקום מחויב במקום קשת. עדיף על קשת: הסירה שומרת טביעת-רגל מזערית (מסתובבת
+// סביב מרכזה) במקום "לטאטא" מרחב עם הגוף תוך כדי פנייה, כך שהסיכוי להיתקע/להיחכך
+// בגוף סמוך קטן משמעותית. dir>0 = החרטום מסתובב ימינה (turn>0: ימין קדימה, שמאל
+// אחורה); dir<0 = שמאלה.
+function spinInPlaceCmd(dir) {
+  return dir > 0
+    ? { left: -MOTOR_SPEED, right: MOTOR_SPEED }
+    : { left: MOTOR_SPEED, right: -MOTOR_SPEED };
 }
 
-// Real-world autonomous tick. GUIDING PRINCIPLE: turning is NOT a magic escape
-// and is never the default. The boat TRAVELS — forward when the bow is clear
-// (steering toward the most open bearing as a forward ARC so it turns while
-// advancing), and backward when the bow is blocked (a committed reverse burst,
-// arced toward the open side). It never performs a net-zero in-place spin; every
-// heading change happens as part of real forward or backward motion. Front-block
-// + boxed-in checks keep it from grinding into a wall.
+// קשת-נסיעה-לאחור: הסירה *נוסעת אחורה* (תזוזה אמיתית, לא סיבוב-במקום עקר) ותוך
+// כדי כך מסובבת את החרטום לכיוון dir (הרחק מהקיר). מנוע אחד לאחור, השני ב-0, כך
+// שיש גם תזוזה אחורה וגם פנייה. dir>0 = החרטום מסתובב ימינה (turn=right-left>0);
+// dir<0 = שמאלה. זה מחליף את הסיבוב-במקום כתגובת-התחמקות, לפי בקשת המשתמש —
+// "אם יש קיר, שיסע אחורה, שלא יסתובב במקום".
+function reverseArcCmd(dir) {
+  return dir > 0
+    ? { left: -RW_REVERSE, right: 0 } // אחורה + חרטום ימינה
+    : { left: 0, right: -RW_REVERSE }; // אחורה + חרטום שמאלה
+}
+
+// פותח פרץ סיבוב-במקום מחויב לכיוון dir. הפרץ קצר (RW_SPIN_BURST_MS ≈ צעד בודד):
+// אחריו הסירה נעצרת וממתינה שהתמונה תתייצב ותתרענן (radarPictureStable) לפני
+// ההחלטה הבאה — סובב → עצור → חכה לתמונה → הערך מחדש, כדי לא לסובב לתוך קיר.
+function startSpinBurst(dir, now) {
+  state.nav.spinDir = dir;
+  state.nav.spinUntil = now + RW_SPIN_BURST_MS;
+}
+
+
+// Real-world autonomous tick. GUIDING PRINCIPLE: heading changes are made by
+// COMMITTED IN-PLACE SPIN bursts, not arcs. Pivoting about the boat's own centre
+// keeps a minimal footprint, so it is far less likely to snag the hull on a
+// nearby body than an arc that sweeps the hull sideways through space. Each spin
+// burst is short (RW_SPIN_BURST_MS): after it the boat STOPS and waits for the
+// radar picture to settle and refresh before deciding again, so it never turns
+// blind into a body it has not re-scanned. It TRAVELS straight forward when the
+// bow is already aimed at open water, and backs STRAIGHT out only when boxed in
+// (no open heading to spin toward). Front-block + boxed-in checks keep it from
+// grinding into a wall.
 function updateAutonomousRealworld() {
   const now = performance.now();
+
+  // --- פרץ סיבוב-במקום מחויב בעיצומו: מכבדים אותו עד סופו גם אם התמונה כרגע
+  // "לא-יציבה" (הסחרור עצמו הופך אותה ללא-יציבה). זה סיבוב מכוון וקצר, ולכן הוא
+  // נבדק לפני מחסום ה-radarPictureStable — אחרת הסחרור היה עוצר את עצמו מיד. ---
+  if (now < state.nav.spinUntil) {
+    const sc = spinInPlaceCmd(state.nav.spinDir);
+    state.avoidDir = 0;
+    state.cmd.leftSpeed = sc.left;
+    state.cmd.rightSpeed = sc.right;
+    return;
+  }
+
+  // אחרי סיבוב במקום התמונה עוד נמרחת/מתייצבת (radarPictureStable=false): אל
+  // תחליט על סמך מכ"ם לא-אמין — עוצרים במקום עד שהסחרור נעצר וסריקה טרייה בנתה
+  // מחדש את התמונה. העצירה גם מאיצה את דעיכת קצב-הסחרור (DR_TURN_DRAG), כך שחלון
+  // ההתייצבות מתחיל לספור מיד.
+  if (!radarPictureStable()) {
+    state.avoidDir = 0;
+    state.cmd.leftSpeed = 0;
+    state.cmd.rightSpeed = 0;
+    return;
+  }
 
   // --- Seed phase: gentle straight pulse until the bow is learned online ---
   // (all bearings are bow-relative via the online-calibrated bow offset).
   if (state.nav.rwPhase === "calib") {
-    const frontNow = liveDistance(0, RW_FRONT_CONE_DEG);
+    const frontNow = liveCone(0, RW_FRONT_CONE_DEG).min;
     const done = now - (state.nav.calibStart || now) >= CALIB_DURATION_MS;
     if (frontNow < RW_BLOCK_CM || done || state.nav.bowLocked) {
       state.nav.rwPhase = "run";
@@ -1788,35 +2216,71 @@ function updateAutonomousRealworld() {
   }
 
   const fc = liveCone(0, RW_FRONT_CONE_DEG);
-  const front = fc.median;
+  // Use the cone MIN (nearest fresh return), not the median: with the WIDE front
+  // cone a single close wall dead-ahead must not be outvoted by open water beside
+  // it. Upstream median-of-3 per sensor already despikes, so min is not spiky.
+  const front = fc.min;
+  // Bow-relative clearances on the four cardinal sides. LEFT/RIGHT drive the
+  // reactive turn-away and the left-wall follower; REAR gates reversing so we
+  // never back into a wall astern ("wall behind -> go forward").
+  const leftCone = liveCone(-90, RW_WALL_TOL_DEG);
+  const rightCone = liveCone(90, RW_WALL_TOL_DEG);
+  const leftD = leftCone.median;
+  const rightD = rightCone.median;
+  const rear = liveDistance(180, RW_FRONT_CONE_DEG);
 
-  // --- Committed reverse burst in progress: honor it to completion even once
-  // the front reads clear, so we back off a real distance instead of flipping
-  // straight back to forward (the pointless forward/back jitter). ---
+  // --- Committed reverse burst in progress: keep BACKING AWAY for a real
+  // distance UNLESS a wall appears astern — a wall behind us means we cannot back
+  // up, so we abort and re-decide this tick instead of backing into it. The burst
+  // may be STRAIGHT back (front wall) or a REVERSE ARC (side wall: backs while
+  // swinging the bow off the wall). Never an in-place spin. ---
   if (now < state.nav.reverseUntil) {
-    const leftQ = liveDistance(-RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
-    const rightQ = liveDistance(RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
-    const boxed = leftQ < RW_BLOCK_CM && rightQ < RW_BLOCK_CM;
-    const openDir = rightQ >= leftQ ? 1 : -1;
-    const rc = reverseArcCmd(openDir, boxed);
+    if (rear < RW_BLOCK_CM) {
+      state.nav.reverseUntil = 0; // wall behind -> stop reversing, re-decide
+    } else {
+      state.avoidDir = 0;
+      const rc = state.nav.reverseArcDir
+        ? reverseArcCmd(state.nav.reverseArcDir)
+        : { left: -RW_REVERSE, right: -RW_REVERSE };
+      state.cmd.leftSpeed = rc.left;
+      state.cmd.rightSpeed = rc.right;
+      return;
+    }
+  }
+
+  // --- Wall AHEAD (front is the most dangerous, we travel forward). Response:
+  // back STRAIGHT out — NEVER turn/spin when a wall is dead ahead (user rule).
+  // Commit a reverse burst so the boat gains real distance. Only if the stern is
+  // ALSO blocked (can't back up without hitting it) do we HOLD and wait for a
+  // fresh scan instead of spinning. Steering away happens later, via the
+  // side keep-away logic, once the bow is no longer blocked. ---
+  if (fc.count > 0 && front < RW_BLOCK_CM) {
     state.avoidDir = 0;
-    state.cmd.leftSpeed = rc.left;
-    state.cmd.rightSpeed = rc.right;
+    if (rear >= RW_BLOCK_CM) {
+      state.nav.reverseArcDir = 0; // straight back
+      state.nav.reverseUntil = now + RW_REVERSE_BURST_MS; // wall ahead -> straight reverse
+      state.cmd.leftSpeed = -RW_REVERSE;
+      state.cmd.rightSpeed = -RW_REVERSE;
+    } else {
+      state.cmd.leftSpeed = 0; // boxed front+stern -> hold (never spin), wait for scan
+      state.cmd.rightSpeed = 0;
+    }
     return;
   }
 
-  // --- Bow blocked (inside corner or a trap). Turning in place is NOT the
-  // escape: a net-zero spin makes no progress and can grind the hull along the
-  // wall. Instead back off with a COMMITTED reverse burst, arced toward the more
-  // open side so the bow swings toward the opening WHILE actually travelling
-  // backward. Once the front clears, the cruise block resumes forward travel. ---
-  if (fc.count > 0 && front < RW_BLOCK_CM) {
-    const leftQ = liveDistance(-RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
-    const rightQ = liveDistance(RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
-    const openDir = rightQ >= leftQ ? 1 : -1; // +1 = more open on the right
-    const boxed = leftQ < RW_BLOCK_CM && rightQ < RW_BLOCK_CM;
-    const rc = reverseArcCmd(openDir, boxed);
+  // --- KEEP AWAY FROM WALLS (the core of wall-avoidance): a side wall is within
+  // the buffer -> BACK AWAY with a committed REVERSE ARC (drive backward while
+  // swinging the bow toward the more-open side) — NOT an in-place spin. The user
+  // wants the boat to reverse out, not pivot on the spot. The reverse-burst honor
+  // above then keeps backing (aborting only if the stern is blocked). In a
+  // corridor where both sides are within the buffer this swings toward the
+  // farther side, backing the boat toward the open middle. ---
+  if (Math.min(leftD, rightD) < RW_KEEPAWAY_CM && rear >= RW_BLOCK_CM) {
+    const nearSide = leftD <= rightD ? -1 : 1; // which wall is too close
+    const openDir = -nearSide;                 // swing the bow away from it
+    state.nav.reverseArcDir = openDir;
     state.nav.reverseUntil = now + RW_REVERSE_BURST_MS;
+    const rc = reverseArcCmd(openDir);
     state.avoidDir = 0;
     state.cmd.leftSpeed = rc.left;
     state.cmd.rightSpeed = rc.right;
@@ -1835,25 +2299,9 @@ function updateAutonomousRealworld() {
     return;
   }
 
-  // --- Bow is clear: TRAVEL FORWARD toward the most open bearing. Turning is
-  // done as a forward ARC — a gap within RW_ARC_DEADBAND_DEG keeps both motors
-  // forward (dead straight); a gap notably off to a side eases the inner motor
-  // toward 0 so, after the 3-state shaping, one motor drives and the other idles
-  // and the boat turns WHILE advancing. It never spins in place; it only turns
-  // in order to travel. Driving straight also feeds the bow estimator.
-  const openF = bestOpenBearing(-RW_ARC_DEG, RW_ARC_DEG);
-  let left = RW_CRUISE;
-  let right = RW_CRUISE;
-  if (openF.count > 0 && Math.abs(openF.bearing) > RW_ARC_DEADBAND_DEG) {
-    // Ease the inner motor in proportion to the heading error; a large error
-    // drops it below the motor deadzone -> a genuine forward-arc turn.
-    const frac = clamp(Math.abs(openF.bearing) / RW_ARC_DEG, 0, 1);
-    const inner = Math.round(RW_CRUISE * (1 - frac)); // -> 0 at full deflection
-    if (openF.bearing > 0) left = inner; // steer right: ease the left (inner) motor
-    else right = inner; // steer left: ease the right (inner) motor
-  }
-  state.cmd.leftSpeed = left;
-  state.cmd.rightSpeed = right;
+  // --- Open water on all sides: cruise straight forward down the middle. ---
+  state.cmd.leftSpeed = RW_CRUISE;
+  state.cmd.rightSpeed = RW_CRUISE;
 }
 
 // Instantaneous-radar safety envelope for the physical boat (no pose, no map).
@@ -1863,26 +2311,227 @@ function realworldSafeCommand(cmd) {
   // Use the fresh-cone MIN here (not the median): the hard stop must react even
   // to a single genuinely-close return, at the cost of an occasional spray stop.
   if (fc.count > 0 && fc.min < RW_EMERGENCY_CM && netForward > 0) {
-    // Something is right on the bow and we are still driving into it: don't spin
-    // in place — REVERSE away (arced toward the more open side) so we gain real
-    // clearance, and commit a reverse burst so the next ticks keep backing off
-    // instead of lunging forward again.
-    const left = liveDistance(-RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
-    const right = liveDistance(RW_SIDE_BEARING_DEG, RW_SIDE_TOL_DEG);
-    const openDir = right >= left ? 1 : -1;
-    const boxed = left < RW_BLOCK_CM && right < RW_BLOCK_CM;
-    const rc = reverseArcCmd(openDir, boxed);
+    // Something is right on the bow and we are still driving into it. Back
+    // STRAIGHT away (both motors) to gain real clearance — a straight reverse
+    // has a minimal footprint and won't sweep the bow sideways into whatever is
+    // beside us the way an arc or a spin would when a body is this close. Commit
+    // a reverse burst so the next ticks keep backing off instead of lunging
+    // forward again.
     state.avoidDir = 0;
+    state.nav.spinUntil = 0; // cancel any in-progress spin — clearance comes first
+    state.nav.reverseArcDir = 0; // straight back
     state.nav.reverseUntil = performance.now() + RW_REVERSE_BURST_MS;
-    cmd.leftSpeed = rc.left;
-    cmd.rightSpeed = rc.right;
+    cmd.leftSpeed = -RW_REVERSE;
+    cmd.rightSpeed = -RW_REVERSE;
   }
   cmd.leftSpeed = shapeMotorSpeed(cmd.leftSpeed);
   cmd.rightSpeed = shapeMotorSpeed(cmd.rightSpeed);
   return cmd;
 }
 
+// ============================ PROTOTYPE NAVIGATOR ==========================
+// Deliberately DUMB reactive navigator built from the boat's REAL motion
+// primitives: ROTATE-IN-PLACE and DRIVE-STRAIGHT (no arcs, no reverse). Each
+// iteration: find the most-open bearing in the 120° arc in front of the bow
+// (±60°); if the bow is not yet pointed at it, ROTATE IN PLACE toward it; once
+// aligned, DRIVE STRAIGHT forward. Then scan again and repeat. Over successive
+// iterations the incremental rotate-toward-the-open-edge lets the bow swing past
+// 60° when needed, so the boat can turn away from a blocked front. Toggle with
+// PROTO_NAV. All bearings are bow-relative via liveScan.
+const PROTO_NAV = true;             // true = use this prototype instead of the sophisticated nav
+const PROTO_ARC_HALF_DEG = 60;      // scan ±60° => the 120° arc in front of the bow
+const PROTO_BIN_DEG = 15;           // scan resolution (~sensor FOV)
+const PROTO_ALIGN_DEG = 18;         // bow within this of the open gap => drive straight; else pulse-rotate
+const PROTO_CLEAR_CM = 70;          // front counts as "open enough to drive" only if the best bearing is at least this clear; below it the front is BLOCKED -> rotate to search, never drive into it
+const PROTO_SIDE_HALF_DEG = 90;     // when blocked, look this wide each side to pick which way to rotate toward open water
+const PROTO_SPEED = 80;             // single drive magnitude (shaped to the 40-100 band on the wire)
+const PROTO_SPIN_PULSE_MS = 150;    // ONE short rotate pulse (holds ~1 control tick), then stop
+const PROTO_SETTLE_MS = 550;        // after a pulse: STOP this long so rotation dies + a fresh scan arrives, THEN re-decide
+const PROTO_EMERGENCY_CM = 40;      // wall closer than this DEAD AHEAD -> back up (the only allowed reverse). Raised so it retreats from farther and never grinds head-on into the wall.
+const PROTO_DEAD_HALF_DEG = 25;     // half-cone treated as "directly in front of the bow" for the emergency check. Kept below +30 so usRight (bowRel ~30+servo with bow fixed at 60) never leaks into the front dead cone and triggers an endless false reverse.
+const PROTO_REVERSE_MS = 250;       // how long the emergency back-up lasts (~0.25 second)
+const PROTO_SIDE_CM = 30;           // wall closer than this on a SIDE -> run that side's motor ~1s to push the bow away (raised +5cm so the boat keeps more clearance from side walls)
+const PROTO_SIDE_TOL_DEG = 35;      // ± tolerance around ±90° for the side check
+const PROTO_SIDE_MS = 1000;         // how long the single side-motor burst lasts (~1 second)
+const PROTO_REAR_CM = 30;           // while reversing, wall closer than this BEHIND -> abort reverse, pulse FORWARD (raised +5cm for more rear clearance)
+const PROTO_REAR_TOL_DEG = 40;      // ± tolerance around 180° (rear) for the astern check
+const PROTO_FWD_PULSE_MS = 300;     // how long the escape-forward pulse lasts when a wall is close astern
+// Turn polarity: the physical boat rotated OPPOSITE to the code's turn convention
+// (observed live: it turned TOWARD a wall instead of away). -1 flips every turn
+// (in-place spin AND single-motor arc) so the bow rotates the intended way. If
+// turns ever come out reversed again, set this to +1.
+const PROTO_TURN_SIGN = -1;
+
+// In-place spin that rotates the BOW toward bowDir (+1=right,-1=left), honoring
+// the boat's real turn polarity.
+function protoSpinCmd(bowDir) {
+  return spinInPlaceCmd(bowDir * PROTO_TURN_SIGN);
+}
+// Single forward motor (arc) that rotates the BOW toward bowDir, same polarity.
+function protoOneMotorCmd(bowDir) {
+  const d = bowDir * PROTO_TURN_SIGN;
+  return d > 0 ? { left: 0, right: PROTO_SPEED } : { left: PROTO_SPEED, right: 0 };
+}
+
+// Best (max) fresh clearance over a bearing range, with the bearing that gave it.
+function protoBestGap(loDeg, hiDeg) {
+  let best = -1;
+  let bestB = 0;
+  let any = false;
+  for (let b = loDeg; b <= hiDeg; b += PROTO_BIN_DEG) {
+    const c = liveCone(b, PROTO_BIN_DEG * 0.8);
+    if (c.count === 0) continue;
+    any = true;
+    if (c.median > best) {
+      best = c.median;
+      bestB = b;
+    }
+  }
+  return { best, bestB, any };
+}
+
+// Rotate toward the most-open bearing in SHORT PULSES (never a continuous spin),
+// then drive straight. Each cycle: pulse-rotate one small step -> stop & wait for
+// a fresh scan -> re-decide. If the whole front is BLOCKED, rotate toward the
+// more-open SIDE (searching wider than the 120° front) instead of driving into
+// the wall — this is why it stops crashing when open water is beside it.
+function updateAutonomousProto() {
+  const now = performance.now();
+  // 0) EMERGENCY back-up in progress -> keep backing STRAIGHT until the burst
+  //    ends. BUT if a wall is closing in BEHIND us, abort the reverse and pulse
+  //    FORWARD instead so we don't back into the rear wall.
+  if (now < state.nav.reverseUntil) {
+    const rear = liveCone(180, PROTO_REAR_TOL_DEG);
+    if (rear.count > 0 && rear.min < PROTO_REAR_CM) {
+      state.nav.reverseUntil = 0;
+      state.nav.fwdUntil = now + PROTO_FWD_PULSE_MS; // escape forward
+      state.avoidDir = 0;
+      state.cmd.leftSpeed = PROTO_SPEED;
+      state.cmd.rightSpeed = PROTO_SPEED;
+      return;
+    }
+    state.avoidDir = 0;
+    state.cmd.leftSpeed = -PROTO_SPEED;
+    state.cmd.rightSpeed = -PROTO_SPEED;
+    return;
+  }
+  // 0a) Escape-forward pulse in progress (started because a wall was close astern
+  //     during a reverse) -> keep driving forward until it ends.
+  if (now < state.nav.fwdUntil) {
+    state.avoidDir = 0;
+    state.cmd.leftSpeed = PROTO_SPEED;
+    state.cmd.rightSpeed = PROTO_SPEED;
+    return;
+  }
+  // 0b) Wall closer than PROTO_EMERGENCY_CM DIRECTLY in front of the bow -> back
+  //     straight for ~1 second, cancelling any rotate pulse/settle in progress.
+  const dead = liveCone(0, PROTO_DEAD_HALF_DEG);
+  if (dead.count > 0 && dead.min < PROTO_EMERGENCY_CM) {
+    state.nav.reverseUntil = now + PROTO_REVERSE_MS;
+    state.nav.spinUntil = 0;
+    state.nav.settleUntil = 0;
+    state.avoidDir = 0;
+    state.cmd.leftSpeed = -PROTO_SPEED;
+    state.cmd.rightSpeed = -PROTO_SPEED;
+    return;
+  }
+  // 0c) SIDE-motor burst in progress -> keep running that one motor until it ends.
+  //     state.nav.sideDir holds the desired bow-turn direction (away from the wall).
+  if (now < state.nav.sideUntil) {
+    const sc = protoOneMotorCmd(state.nav.sideDir);
+    state.avoidDir = 0;
+    state.cmd.leftSpeed = sc.left;
+    state.cmd.rightSpeed = sc.right;
+    return;
+  }
+  // 0d) Wall closer than PROTO_SIDE_CM on a SIDE -> run a single motor for ~1s to
+  //     turn the bow AWAY from the wall. Left wall -> turn bow right; right wall ->
+  //     turn bow left. If both are close, handle the nearer side first.
+  const leftClose = liveCone(-90, PROTO_SIDE_TOL_DEG);
+  const rightClose = liveCone(90, PROTO_SIDE_TOL_DEG);
+  const leftNear = leftClose.count > 0 && leftClose.min < PROTO_SIDE_CM;
+  const rightNear = rightClose.count > 0 && rightClose.min < PROTO_SIDE_CM;
+  if (leftNear || rightNear) {
+    const nearSide = leftNear && (!rightNear || leftClose.min <= rightClose.min) ? -1 : 1;
+    const awayDir = -nearSide; // turn the bow away from the near wall
+    state.nav.sideDir = awayDir;
+    state.nav.sideUntil = now + PROTO_SIDE_MS;
+    state.nav.spinUntil = 0;
+    state.nav.settleUntil = 0;
+    state.avoidDir = 0;
+    const sc = protoOneMotorCmd(awayDir);
+    state.cmd.leftSpeed = sc.left;
+    state.cmd.rightSpeed = sc.right;
+    return;
+  }
+  // 1) A short rotate pulse is in progress -> keep it until it ends.
+  if (now < state.nav.spinUntil) {
+    const sc = protoSpinCmd(state.nav.spinDir);
+    state.avoidDir = 0;
+    state.cmd.leftSpeed = sc.left;
+    state.cmd.rightSpeed = sc.right;
+    return;
+  }
+  // 2) Post-pulse settle -> STOP so the rotation dies and a fresh sweep arrives
+  //    before we look again (this is what stops the over-rotation).
+  if (now < state.nav.settleUntil) {
+    state.avoidDir = 0;
+    state.cmd.leftSpeed = 0;
+    state.cmd.rightSpeed = 0;
+    return;
+  }
+
+  state.avoidDir = 0;
+  // 3) Decide. Look at the ±60° frontal arc first.
+  const front = protoBestGap(-PROTO_ARC_HALF_DEG, PROTO_ARC_HALF_DEG);
+  // No fresh knowledge in front -> brief stop, wait for the sweep (not reverse).
+  if (!front.any) {
+    state.cmd.leftSpeed = 0;
+    state.cmd.rightSpeed = 0;
+    return;
+  }
+
+  // FRONT BLOCKED: even the most-open front bearing is too close. Do NOT drive
+  // into it — rotate (short pulse) toward the more-open SIDE (looked at wider
+  // than the front arc) to search for the opening beside us. Keep pulsing until
+  // the front opens up, then drive.
+  if (front.best < PROTO_CLEAR_CM) {
+    const right = protoBestGap(0, PROTO_SIDE_HALF_DEG);
+    const left = protoBestGap(-PROTO_SIDE_HALF_DEG, 0);
+    const dir = right.best >= left.best ? 1 : -1; // turn toward the more-open side
+    startProtoPulse(dir, now);
+    return;
+  }
+
+  // FRONT OPEN: bow already pointed at the open gap -> DRIVE STRAIGHT.
+  if (Math.abs(front.bestB) <= PROTO_ALIGN_DEG) {
+    state.cmd.leftSpeed = PROTO_SPEED;
+    state.cmd.rightSpeed = PROTO_SPEED;
+    return;
+  }
+  // FRONT OPEN but off to a side -> one short rotate pulse toward it, then re-scan.
+  startProtoPulse(front.bestB > 0 ? 1 : -1, now);
+}
+
+// Fire ONE short rotate pulse toward dir, then a settle stop before re-deciding.
+function startProtoPulse(dir, now) {
+  state.nav.spinDir = dir;
+  state.nav.spinUntil = now + PROTO_SPIN_PULSE_MS;
+  state.nav.settleUntil = now + PROTO_SPIN_PULSE_MS + PROTO_SETTLE_MS;
+  const sc = protoSpinCmd(dir);
+  state.cmd.leftSpeed = sc.left;
+  state.cmd.rightSpeed = sc.right;
+}
+
 function updateAutonomousCommand() {
+  // Prototype navigator (forward-only, drive-to-the-biggest-front-gap) takes over
+  // BOTH in mock and on real hardware when enabled, so it can be evaluated safely
+  // in the simulator and behaves identically on the water. The sophisticated
+  // sim/real stacks below only run when PROTO_NAV is off.
+  if (PROTO_NAV) {
+    updateAutonomousProto();
+    return;
+  }
   // Physical hardware: use the pose-free instantaneous-radar reactive navigator.
   // The accumulated-map / goal-seeking stack below runs only in the simulator.
   if (!state.mockEnabled) {
@@ -1959,15 +2608,10 @@ function updateAutonomousCommand() {
   );
   const steer = clamp(targetBearing * OPEN_STEER_GAIN, -STEER_MAX, STEER_MAX);
 
-  const fwdClear = getMemoryDistance(0, 25);
-  const openness = clamp(
-    (fwdClear - SAFE_DISTANCE_CM) / (STEER_LOOKAHEAD_CM - SAFE_DISTANCE_CM),
-    0,
-    1
-  );
-  const speed = Math.round(
-    AUTONOMOUS_MIN_SPEED + openness * (AUTONOMOUS_SPEED - AUTONOMOUS_MIN_SPEED)
-  );
+  // אין שליטה במהירות: מהירות-השיוט קבועה (AUTONOMOUS_SPEED). ההיגוי מתבטא רק
+  // דרך ה-steer שמעביר מנוע פנימי לעצירה/לאחור אחרי הקוונטיזציה ל-3 מצבים — בדיוק
+  // כמו קשת בשליטה ידנית. מהירות ההתקדמות בפועל לעולם אינה מותאמת לפי המרחק.
+  const speed = AUTONOMOUS_SPEED;
 
   // steer > 0 raises the right motor above the left => turns right.
   state.cmd.leftSpeed = clamp(speed - steer, -255, 255);
@@ -1975,8 +2619,15 @@ function updateAutonomousCommand() {
 }
 
 function updateCommandUI() {
-  leftSpeedValue.textContent = String(state.cmd.leftSpeed);
-  rightSpeedValue.textContent = String(state.cmd.rightSpeed);
+  // המנועים 3-מצביים בלבד (קדימה / אחורה / מנוחה) — גם בשליטה ידנית וגם אוטונומית.
+  // מציגים את המצב אחרי הכימות (shapeMotorSpeed) כדי שהתצוגה תשקף בדיוק את מה
+  // שהמנוע יריץ בפועל, ללא מהירות-ביניים.
+  const label = (v) => {
+    const s = shapeMotorSpeed(v);
+    return s > 0 ? "קדימה" : s < 0 ? "אחורה" : "מנוחה";
+  };
+  leftSpeedValue.textContent = label(state.cmd.leftSpeed);
+  rightSpeedValue.textContent = label(state.cmd.rightSpeed);
 }
 
 // Safety envelope: intercepts outgoing steering commands (manual or autonomous)
@@ -2001,9 +2652,26 @@ function computeSafeCommand() {
     return cmd;
   }
 
+  // Prototype navigator is self-contained and FORWARD-ONLY (in both mock and
+  // real). Skip every safety override so nothing can inject a reverse/spin; just
+  // pass the shaped command through.
+  if (PROTO_NAV) {
+    cmd.leftSpeed = shapeMotorSpeed(cmd.leftSpeed);
+    cmd.rightSpeed = shapeMotorSpeed(cmd.rightSpeed);
+    return cmd;
+  }
+
   // Physical hardware: safety comes from the instantaneous radar, not from the
   // pose-projected accumulated map (which drifts with dead reckoning).
   if (!state.mockEnabled) {
+    // Prototype navigator is FORWARD-ONLY by request (straight / fwd-right /
+    // fwd-left, never reverse). Skip the emergency-reverse safety override so it
+    // can't drive the boat backward; just pass the shaped command through.
+    if (PROTO_NAV) {
+      cmd.leftSpeed = shapeMotorSpeed(cmd.leftSpeed);
+      cmd.rightSpeed = shapeMotorSpeed(cmd.rightSpeed);
+      return cmd;
+    }
     return realworldSafeCommand(cmd);
   }
 
@@ -2130,27 +2798,19 @@ function computeSafeCommand() {
     }
   }
 
-  // --- מושל מהירות קדימה (אנטי-נגיחה בלבד) ---
-  // חיתוך אחרון וקשיח: מהירות ההתקדמות *נטו* (סכום המנועים) מוגבלת פרופורציונלית
-  // למרחק הפנוי בחרוט הקדמי, כך שהסירה לעולם לא דוהרת לתוך גוף שזוהה — היא עוצרת
-  // בהתקדמות במרחק GOVERNOR_STOP_CM. החיתוך מוריד ערך שווה משני המנועים ולכן שומר
-  // על הפרש המנועים (הסיבוב/היגוי) — הסירה עדיין יכולה להסתובב ולפנות, רק לא
-  // להתקדם לתוך המכשול. כל ההיגוי (חיפוש מרחב פתוח + סיבוב-בריחה) מנוהל ע"י שכבת
-  // הניווט; המושל אינו כופה כיוון פנייה משלו, כדי לא להיאבק עם הניווט ולתקוע את
-  // הסירה. תנועה לאחור אינה מוגבלת (בריחה). פועל גם בשליטה ידנית וגם באוטונומית.
+  // --- עצירת התקדמות בינארית (אנטי-נגיחה, ללא שליטה במהירות) ---
+  // הניווט האוטונומי מוגבל בדיוק לאותה קשת פקודות כמו השליטה הידנית: קדימה /
+  // אחורה / עצירה לכל מנוע — בלי ויסות-מהירות פרופורציונלי. לכן המושל אינו מאט
+  // בהדרגה אלא מבטל את רכיב-ההתקדמות המשותף בבת-אחת כשמזוהה גוף בתוך
+  // GOVERNOR_STOP_CM: מורידים סכום שווה משני המנועים עד שהמהירות הנטו קדימה
+  // מתאפסת. ההפרש בין המנועים נשמר, כך שהסירה עדיין יכולה להסתובב אל הפתוח
+  // (בשילוב הקוונטיזציה למטה — פנייה/סיבוב), רק לא לדהור לתוך המכשול. תנועה
+  // לאחור אינה מוגבלת (בריחה). פועל גם בשליטה ידנית וגם באוטונומית.
   const netOut = cmd.leftSpeed + cmd.rightSpeed;
-  if (netOut > 0 && forwardClearance < GOVERNOR_RANGE_CM) {
-    const frac = clamp(
-      (forwardClearance - GOVERNOR_STOP_CM) / (GOVERNOR_RANGE_CM - GOVERNOR_STOP_CM),
-      0,
-      1
-    );
-    const cap = frac * 510; // מהירות נטו מירבית מותרת (שני מנועים על 255)
-    if (netOut > cap) {
-      const reduce = (netOut - cap) / 2;
-      cmd.leftSpeed = clamp(cmd.leftSpeed - reduce, -255, 255);
-      cmd.rightSpeed = clamp(cmd.rightSpeed - reduce, -255, 255);
-    }
+  if (netOut > 0 && forwardClearance < GOVERNOR_STOP_CM) {
+    const reduce = netOut / 2; // מבטל את מלוא רכיב-ההתקדמות המשותף (הנטו קדימה -> 0)
+    cmd.leftSpeed = clamp(cmd.leftSpeed - reduce, -255, 255);
+    cmd.rightSpeed = clamp(cmd.rightSpeed - reduce, -255, 255);
   }
 
   // קוונטיזציה סופית של פקודת המנוע האוטונומית למדרגי הכוח (0 / 70 / 100, עם
@@ -2193,6 +2853,18 @@ function drawRadar() {
   drawSensorArcs(cx, cy, maxR);
   drawSensorBeams(cx, cy, maxR);
   drawRangeLabels(cx, cy, maxR);
+
+  // בזמן סיבוב/התייצבות התמונה נבנית מחדש מסריקה טרייה — מסמנים למפעיל שהמכ"ם
+  // מתייצב, כדי שהתצוגה הדלילה לא תיראה כתקלה.
+  if (!radarPictureStable()) {
+    radarCtx.save();
+    radarCtx.fillStyle = "rgba(255, 214, 10, 0.92)";
+    radarCtx.font = "bold 16px system-ui, sans-serif";
+    radarCtx.textAlign = "center";
+    radarCtx.textBaseline = "middle";
+    radarCtx.fillText("מייצב תמונת מכ\"ם…", cx, cy - maxR - 6);
+    radarCtx.restore();
+  }
 
   requestAnimationFrame(drawRadar);
 }
@@ -2683,11 +3355,19 @@ function drawBoat(cx, cy, pxPerCm) {
 // dir = their bow-relative bearing at servo home (0); the live bearing adds the
 // current servo angle (radarAngle). Boat is drawn pointing up (front = 0°).
 const SENSOR_BEAMS = [
-  { dir: 0, key: "usFront", color: "rgba(44, 255, 197, 1)" },
+  { dir: 0, key: "usFront", color: "rgba(44, 255, 197, 1)", masked: true },
   { dir: 90, key: "usRight", color: "rgba(255, 150, 100, 1)" },
   { dir: 180, key: "usRadar", color: "rgba(200, 120, 255, 1)" },
   { dir: 270, key: "usLeft", color: "rgba(100, 200, 255, 1)" },
 ];
+
+// חיישן החזית (usFront / echo A0) פגום: כשהחרטום פתוח הוא מחזיר ~65 ס"מ כמעט-קבוע
+// (החזר ממשטח המים כי הוא מוטה מעט מטה). אבל חיישן אולטרסוני מדווח את ההד הקרוב
+// ביותר, ולכן קיר אמיתי קרוב מ~65 ס"מ *כן* מדווח נכון. לכן: לניווט הוא לא ממוסך
+// (RW_BLOCK_CM מוגדר מתחת לרצועת החזר-המים כך שמים פתוחים לא יבלמו שקר, אבל קיר
+// קרוב מלפנים כן יעצור ויסע לאחור). לתצוגה בלבד הוא ממוסך (MASK_FRONT_DISPLAY) כדי
+// שהחזר-המים בפתוח לא יצייר "קיר מדומה" על המכ"ם. אחרי תיקון החומרה — false.
+const MASK_FRONT_DISPLAY = true;
 
 // Radar persistence: each boat-relative angle slot keeps its last scan for a
 // short while (RADAR_TTL_MS). Fresh sweeps refresh it; stale readings expire so
@@ -2737,6 +3417,35 @@ function resetRadarWalls() {
   for (const k of Object.keys(prevBeamVal)) delete prevBeamVal[k];
 }
 
+// בודק אם קבוצת נקודות היא "טבעת"-רפאים ולא קיר שטוח. קלט: xy במסגרת-חרטום עם
+// שדה .b (אזימוט יחסי, מעלות). קיר שטוח על פני קשת רחבה מראה טווח שגדל לעבר
+// הקצוות (∝1/cos מהניצב); הד-רפאים מחזיר טווח כמעט-קבוע. מפעילים רק על קשת רחבה
+// (>= RADAR_RING_ANG_MIN_DEG). מחזיר true אם הטווח בקצוות אינו רחוק מהמרכז לפחות
+// פי RADAR_RING_EDGE_RATIO — כלומר טבעת-רפאים שאין לצייר.
+function isPhantomRing(xy) {
+  if (xy.length < 4) return false; // מעט מדי נקודות כדי להכריע — לא דוחים
+  const pts = xy.map((q) => ({ b: q.b, r: Math.hypot(q.x, q.y) }));
+  let bMin = Infinity;
+  let bMax = -Infinity;
+  for (const p of pts) {
+    if (p.b < bMin) bMin = p.b;
+    if (p.b > bMax) bMax = p.b;
+  }
+  const span = bMax - bMin;
+  if (span < RADAR_RING_ANG_MIN_DEG) return false; // קשת צרה — משאירים ללוגיקה הרגילה
+  const mid = (bMin + bMax) / 2;
+  const median = (arr) => {
+    if (!arr.length) return null;
+    const s = [...arr].sort((a, b) => a - b);
+    return s[s.length >> 1];
+  };
+  const centerR = median(pts.filter((p) => Math.abs(p.b - mid) <= 10).map((p) => p.r));
+  const edgeR = median(pts.filter((p) => Math.abs(p.b - mid) >= span * 0.35).map((p) => p.r));
+  if (centerR == null || edgeR == null) return false;
+  // קיר שטוח: הקצה רחוק מהמרכז (edgeR גדול). טבעת: edgeR ≈ centerR (או קטן) -> רפאים.
+  return edgeR < centerR * RADAR_RING_EDGE_RATIO;
+}
+
 // Per-side linear interpolation. Groups the currently-live raw detections by
 // sensor side (each sensor owns its own ~75° arc), fits ONE straight line per
 // side (orthogonal / total-least-squares, so a wall at any orientation works,
@@ -2749,8 +3458,16 @@ function resetRadarWalls() {
 function updateRadarWalls() {
   const now = performance.now();
   const heading = state.pose.headingDeg;
-  const bx = state.pose.x;
-  const by = state.pose.y;
+  // Real HW: the radar picture is BOAT-FIXED — the dots are drawn at their
+  // measured range and deliberately do NOT slide as the boat advances. So the
+  // walls must ignore the boat's TRANSLATION too, otherwise the world-frozen
+  // segment drifts off the very returns it was fit from (heading is already
+  // handled identically for dots and walls, so only the position matters). Zero
+  // the boat position here (and matchingly in drawSensorArcs) so walls live in
+  // the same boat-fixed frame as the dots. The simulator keeps the true pose to
+  // accumulate a genuine world map.
+  const bx = state.mockEnabled ? state.pose.x : 0;
+  const by = state.mockEnabled ? state.pose.y : 0;
   const bowOff = state.nav.bowOffsetDeg ?? BOW_SERVO_OFFSET_DEG;
 
   // Bucket live, valid detections into the 4 sensor sides. slot - heading is
@@ -2765,9 +3482,26 @@ function updateRadarWalls() {
     if (e.filled) continue;
     if (!e.value || e.value >= 999 || now - e.t > RADAR_WALL_FIT_TTL_MS) continue;
     if (e.value > sim.maxRange) continue;
-    const rel = normalizeDeg(slot - heading); // 0..360 from bow
+    let rel;
+    let r;
+    if (state.mockEnabled && e.wx != null) {
+      // Derive the point's CURRENT bow-relative bearing/range from its FROZEN
+      // world position (e.wx/wy) reprojected from the current pose — exactly like
+      // the world-anchored dots. Using the stored (slot - heading, value) instead
+      // places the point at its range from the OLD pose, so as the boat TRANSLATES
+      // the fit warps and the walls drift off the dots (the "distortion during
+      // movement"). Now walls + dots share one world frame and stay put while the
+      // boat moves.
+      const dx = e.wx - bx;
+      const dy = e.wy - by;
+      r = Math.hypot(dx, dy);
+      rel = normalizeDeg((Math.atan2(dx, dy) * 180) / Math.PI - heading);
+    } else {
+      rel = normalizeDeg(slot - heading); // 0..360 from bow (boat-fixed, real HW)
+      r = e.value;
+    }
     const side = Math.floor(rel / 90) % 4;
-    sides[side].push({ bearingRel: wrap180(rel), r: e.value, fresh: now - e.t <= RADAR_TTL_MS });
+    sides[side].push({ bearingRel: wrap180(rel), r, fresh: now - e.t <= RADAR_TTL_MS });
   }
 
   // --- PHASE 1: per-side geometry stats (bow-frame cartesian) --------------
@@ -2821,9 +3555,35 @@ function updateRadarWalls() {
   }
 
   // --- PHASE 2: shared grid orientation φ ---------------------------------
-  // Circular mean of the line orientations folded into the orthogonal family
-  // (angle × 4, since a grid repeats every 90°). Scattered sides (>=3 pts but
-  // high residual) don't vote. Weight by point count so well-seen walls dominate.
+  // ROBUST estimate from NEARBY POINT PAIRS: two points on the same wall define
+  // that wall's direction, so folding each close pair's edge angle ×4 (the
+  // axis-aligned grid repeats every 90°) and taking the circular mean yields ONE
+  // orientation the whole world snaps to. This is far steadier than averaging
+  // the 4 per-side TLS fits — that averaging is exactly what left the walls at
+  // inconsistent angles (the "picture not good enough"). Falls back to the
+  // per-side estimate only when too few nearby pairs exist (very sparse frame).
+  const allPts = [];
+  for (let side = 0; side < 4; side += 1) {
+    if (stat[side]) for (const q of stat[side].xy) allPts.push(q);
+  }
+  let Psin = 0;
+  let Pcos = 0;
+  let pairN = 0;
+  const PAIR_MAX2 = 45 * 45; // only pairs within ~45 cm are "same wall" evidence
+  for (let i = 0; i < allPts.length; i += 1) {
+    for (let j = i + 1; j < allPts.length; j += 1) {
+      const dpx = allPts[j].x - allPts[i].x;
+      const dpy = allPts[j].y - allPts[i].y;
+      const d2 = dpx * dpx + dpy * dpy;
+      if (d2 < 1 || d2 > PAIR_MAX2) continue;
+      const th = Math.atan2(dpy, dpx);
+      Psin += Math.sin(4 * th);
+      Pcos += Math.cos(4 * th);
+      pairN += 1;
+    }
+  }
+  // Per-side fallback (original method): circular mean of the per-side TLS
+  // orientations folded ×4, weighted by point count.
   let Ssin = 0;
   let Scos = 0;
   for (let side = 0; side < 4; side += 1) {
@@ -2833,7 +3593,13 @@ function updateRadarWalls() {
     Ssin += s.count * Math.sin(4 * s.theta);
     Scos += s.count * Math.cos(4 * s.theta);
   }
-  const phi = Ssin !== 0 || Scos !== 0 ? Math.atan2(Ssin, Scos) / 4 : null;
+  // Prefer the robust pair estimate; fall back to per-side only when too sparse.
+  const phi =
+    pairN >= 4 && (Psin !== 0 || Pcos !== 0)
+      ? Math.atan2(Psin, Pcos) / 4
+      : Ssin !== 0 || Scos !== 0
+      ? Math.atan2(Ssin, Scos) / 4
+      : null;
 
   // Snap an orientation onto the nearest of the two grid axes {φ, φ+90°}.
   const snapToGrid = (thetaRad) => {
@@ -2865,7 +3631,14 @@ function updateRadarWalls() {
   };
 
   // --- PHASE 3: place each side's wall ------------------------------------
-  const SEG_MIN_LEN_CM = 30; // default half-visible extent when a side is sparse
+  // Obstacle walls are 1 m long × 5 cm THICK, so a wall can legitimately be seen
+  // as a large face (~up to 1 m broadside) OR as a tiny ~5 cm edge when viewed
+  // end-on — a short detection is NOT automatically wrong. So we do NOT force a
+  // 1 m minimum (that stretched real short/edge returns into fake metre-long
+  // walls); we draw the OBSERVED extent, with only a small visible floor when a
+  // side is sparse. Free ends are still run out to the range edge at draw time
+  // (extendWallFreeEndsToRange), and grid-enforce + corner-join tidy the ends.
+  const SEG_MIN_LEN_CM = 20; // just a visible floor; real extent otherwise
   for (let side = 0; side < 4; side += 1) {
     const s = stat[side];
     if (!s) {
@@ -2878,6 +3651,12 @@ function updateRadarWalls() {
     if (s.count >= RADAR_FIT_MIN_POINTS) {
       if (s.res > RADAR_FIT_MAX_RESIDUAL_CM) {
         // Points don't lie on a line (scattered bodies / open water) — not a wall.
+        radarWalls.delete(side);
+        continue;
+      }
+      // הד-רפאים בטווח-קבוע (מים/קרקע) מתאים לקו בשיורי נמוך אך אינו קיר: הטווח
+      // כמעט אינו משתנה לאורך הקשת. דוחים אותו כדי לא לצייר קיר במקום פנוי.
+      if (isPhantomRing(xy)) {
         radarWalls.delete(side);
         continue;
       }
@@ -2950,22 +3729,72 @@ function updateRadarWalls() {
     const snx = -suy;
     const sny = sux;
     const sMn = p1.x * snx + p1.y * sny;
-    for (const q of xy) {
-      // Only fresh returns feed the navigator; older points are display-only so
-      // autonomy never treats a stale bearing as a live, confirmed reading.
-      if (!q.fresh) continue;
-      const a = degToRad(q.b);
+    // Feed the NAVIGATOR from the reconstructed wall, not just the raw samples.
+    // A covered RUN (consecutive FRESH points <= RADAR_CORNER_REACH_CM apart
+    // ALONG the wall) is a CONTINUOUS barrier — no passage that narrow can exist
+    // (min corridor is 75 cm) — so we fill EVERY bearing bin the run subtends
+    // with the wall's ray-cast range, not only the few sampled bearings. This is
+    // the reconstructed WORLD driving autonomy: the boat reacts to the wall as
+    // the solid, continuous obstacle it really is, while gaps > 40 cm are left
+    // OPEN as genuine passages. Only FRESH-backed runs feed nav (older points are
+    // display-only), so autonomy never acts on a stale bearing.
+    const rayRange = (bDeg) => {
+      const a = degToRad(bDeg);
       const denom = Math.sin(a) * snx + Math.cos(a) * sny;
-      if (Math.abs(denom) >= 1e-3) {
-        const rr = sMn / denom;
-        if (rr > 0) {
-          // liveScan is keyed in the RAW (pose-free) bow frame exactly like
-          // updateLiveScan: bin = binBearing(rawBearing - bowOff). q.b is already
-          // that raw bearing (slot - heading), so DON'T add heading back here.
-          const bin = binBearing(q.b - bowOff);
-          liveScan.set(bin, { dist: rr, t: now });
+      if (Math.abs(denom) < 1e-3) return null;
+      const rr = sMn / denom;
+      return rr > 0 ? rr : null;
+    };
+    const fresh = xy
+      .filter((q) => q.fresh)
+      .map((q) => ({ b: q.b, t: q.x * sux + q.y * suy }))
+      .sort((a, b) => a.t - b.t);
+    for (let i = 0; i < fresh.length; i += 1) {
+      const rr = rayRange(fresh[i].b);
+      if (rr != null) liveScan.set(binBearing(fresh[i].b - bowOff), { dist: rr, t: now });
+      // Fill the bins BETWEEN this fresh sample and the next one IF they belong
+      // to the same continuous run (<= 40 cm apart along the wall).
+      if (i + 1 < fresh.length && fresh[i + 1].t - fresh[i].t <= RADAR_CORNER_REACH_CM) {
+        const d = wrap180(fresh[i + 1].b - fresh[i].b);
+        const steps = Math.floor(Math.abs(d) / LIVE_BIN_DEG);
+        const dir = d >= 0 ? 1 : -1;
+        for (let s = 1; s <= steps; s += 1) {
+          const bb = fresh[i].b + dir * s * LIVE_BIN_DEG;
+          const rrb = rayRange(bb);
+          if (rrb != null) liveScan.set(binBearing(bb - bowOff), { dist: rrb, t: now });
         }
       }
+    }
+
+    // --- DISPLAY coverage RUNS: never draw the fitted line across an internal
+    // coverage GAP > RADAR_CORNER_REACH_CM (the user's "don't connect points >40
+    // cm apart" rule, applied ALONG the wall, not just at its ends). Project each
+    // point onto the smoothed segment (p1->p2) to a fraction in [0,1], sort, and
+    // break into runs wherever consecutive points are more than 40 cm apart. The
+    // OUTER ends of the first/last run are pinned to 0 and 1 so the endpoint
+    // corner-join/grid-enforce still connect the wall to its neighbours; only
+    // genuine interior gaps (passages) become breaks. Fractions are relative to
+    // w.x1..w.y2, so later join/grid-enforce endpoint edits carry the runs along.
+    // radarWalls itself (nav feed, smoothing) is untouched — this is display only.
+    const wobj = radarWalls.get(side);
+    if (wobj && xy.length >= RADAR_FIT_MIN_POINTS && slen > 1) {
+      const fr = xy
+        .map((q) =>
+          clamp(((q.x - p1.x) * (p2.x - p1.x) + (q.y - p1.y) * (p2.y - p1.y)) / (slen * slen), 0, 1)
+        )
+        .sort((a, b) => a - b);
+      const runs = [];
+      let f0 = 0; // pin the first run's outer end to the segment start
+      let fp = fr[0];
+      for (let i = 1; i < fr.length; i += 1) {
+        if ((fr[i] - fp) * slen > RADAR_CORNER_REACH_CM) {
+          runs.push([f0, fp]);
+          f0 = fr[i];
+        }
+        fp = fr[i];
+      }
+      runs.push([f0, 1]); // pin the last run's outer end to the segment end
+      wobj.runs = runs;
     }
   }
 
@@ -2973,6 +3802,207 @@ function updateRadarWalls() {
   for (const [side, w] of radarWalls) {
     if (now - w.t > WALL_TTL_MS) radarWalls.delete(side);
   }
+
+  // יישור-רשת סופי: ההחלקה (EMA על הקצוות) עלולה להטות קטע במעט מזווית-הרשת
+  // המדויקת. כופים על כל קיר להיות מיושר בדיוק ל-{φ, φ+90°} סביב מרכזו (מרכז+אורך
+  // נשמרים), כדי שכל הקווים יישארו ניצבים או מקבילים זה לזה בדיוק (90°/180°).
+  if (phi !== null) {
+    for (const [, w] of radarWalls) {
+      const cxw = (w.x1 + w.x2) / 2;
+      const cyw = (w.y1 + w.y2) / 2;
+      const half = Math.hypot(w.x2 - w.x1, w.y2 - w.y1) / 2;
+      const O = snapToGrid(Math.atan2(w.y2 - w.y1, w.x2 - w.x1));
+      const ux = Math.cos(O);
+      const uy = Math.sin(O);
+      w.x1 = cxw - ux * half;
+      w.y1 = cyw - uy * half;
+      w.x2 = cxw + ux * half;
+      w.y2 = cyw + uy * half;
+    }
+  }
+
+  // חיבור קצוות: אחרי שכל הקירות מוקמו, הוחלקו ויושרו-לרשת, מפגישים זוגות שקצותיהם
+  // קרובים (< WALL_JOIN_GAP_CM) — קו ישר (~180°) או פינה (~90°) — תוך שמירת היישור.
+  joinNearbyWalls();
+}
+
+// חיתוך שני ישרים אינסופיים: (px,py)+t·(dx,dy) עם (qx,qy)+s·(ex,ey). מחזיר null
+// אם הם מקבילים (מכנה ~0).
+function lineIntersect(px, py, dx, dy, qx, qy, ex, ey) {
+  const denom = dx * ey - dy * ex;
+  if (Math.abs(denom) < 1e-6) return null;
+  const t = ((qx - px) * ey - (qy - py) * ex) / denom;
+  return { x: px + dx * t, y: py + dy * t };
+}
+
+// מפגיש זוגות קירות שקצותיהם קרובים זה לזה. לכל זוג בוחרים את הזוג הקרוב ביותר של
+// קצוות; אם הפער קטן מ-WALL_JOIN_GAP_CM מחברים אותם לנקודת-מפגש אחת:
+//   * קירות ~מקבילים  -> אמצע שני הקצוות (מתמזגים לקו ישר, ~180°)
+//   * קירות ~ניצבים   -> חיתוך הישרים (פינה בזווית ישרה, ~90°)
+// פועל על הקצוות הקפואים-בעולם של radarWalls (תצוגה + החלקת-הפריים הבא).
+function joinNearbyWalls() {
+  const walls = [...radarWalls.values()];
+  for (let i = 0; i < walls.length; i += 1) {
+    for (let j = i + 1; j < walls.length; j += 1) {
+      const A = walls[i];
+      const B = walls[j];
+      // ארבעה שילובי קצוות — בוחרים את הזוג הקרוב ביותר.
+      const aEnds = [[A.x1, A.y1, 1], [A.x2, A.y2, 2]];
+      const bEnds = [[B.x1, B.y1, 1], [B.x2, B.y2, 2]];
+      let best = null;
+      for (const ae of aEnds) {
+        for (const be of bEnds) {
+          const d = Math.hypot(ae[0] - be[0], ae[1] - be[1]);
+          if (!best || d < best.d) best = { d, ae, be };
+        }
+      }
+      if (!best) continue;
+
+      // כיווני הקטעים (מנורמלים).
+      let adx = A.x2 - A.x1;
+      let ady = A.y2 - A.y1;
+      let bdx = B.x2 - B.x1;
+      let bdy = B.y2 - B.y1;
+      const alen = Math.hypot(adx, ady) || 1;
+      const blen = Math.hypot(bdx, bdy) || 1;
+      adx /= alen;
+      ady /= alen;
+      bdx /= blen;
+      bdy /= blen;
+      const parallelness = Math.abs(adx * bdx + ady * bdy); // 1=מקביל, 0=ניצב
+
+      // מקבילים: מיזוג רק על פני פער צר (זהירות מפני מיזוג שני קירות שונים). ניצבים
+      // (פינה): מרשים טווח-הגעה גדול יותר כדי להאריך אותם עד נקודת-המפגש ב-90°.
+      const gapLimit = parallelness >= 0.5 ? WALL_JOIN_GAP_CM : RADAR_CORNER_REACH_CM;
+      if (best.d >= gapLimit) continue;
+
+      if (parallelness >= 0.5) {
+        // ~מקבילים -> קו ישר אחד (180°). לא מספיק להזיז קצה בודד — זה מטה את הקו;
+        // מיישרים את שני הקירות לאותו היסט (ממוצע) לאורך כיוון A, כך שהם קו-לינאריים
+        // בדיוק (הכיוון נשמר -> היישור לרשת נשמר), ואז מפגישים את הקצוות הקרובים
+        // בנקודת-אמצע שנמצאת על אותו קו.
+        const ux = adx;
+        const uy = ady;
+        const nx = -uy;
+        const ny = ux;
+        const aMx = (A.x1 + A.x2) / 2;
+        const aMy = (A.y1 + A.y2) / 2;
+        const bMx = (B.x1 + B.x2) / 2;
+        const bMy = (B.y1 + B.y2) / 2;
+        const cShared = (aMx * nx + aMy * ny + (bMx * nx + bMy * ny)) / 2;
+        const reoff = (px, py) => {
+          const t = px * ux + py * uy; // מיקום לאורך הקו נשמר
+          return { x: t * ux + cShared * nx, y: t * uy + cShared * ny };
+        };
+        const a1 = reoff(A.x1, A.y1);
+        const a2 = reoff(A.x2, A.y2);
+        const b1 = reoff(B.x1, B.y1);
+        const b2 = reoff(B.x2, B.y2);
+        A.x1 = a1.x;
+        A.y1 = a1.y;
+        A.x2 = a2.x;
+        A.y2 = a2.y;
+        B.x1 = b1.x;
+        B.y1 = b1.y;
+        B.x2 = b2.x;
+        B.y2 = b2.y;
+        // הקצוות הקרובים (על אותו קו כעת) -> נקודת-אמצע משותפת, כדי לגשר על הפער.
+        const aNx = best.ae[2] === 1 ? A.x1 : A.x2;
+        const aNy = best.ae[2] === 1 ? A.y1 : A.y2;
+        const bNx = best.be[2] === 1 ? B.x1 : B.x2;
+        const bNy = best.be[2] === 1 ? B.y1 : B.y2;
+        const mx = (aNx + bNx) / 2;
+        const my = (aNy + bNy) / 2;
+        if (best.ae[2] === 1) {
+          A.x1 = mx;
+          A.y1 = my;
+        } else {
+          A.x2 = mx;
+          A.y2 = my;
+        }
+        if (best.be[2] === 1) {
+          B.x1 = mx;
+          B.y1 = my;
+        } else {
+          B.x2 = mx;
+          B.y2 = my;
+        }
+      } else {
+        // ~ניצבים -> פינה ב-90°: חיתוך הישרים דרך הקטעים. נקודת-החיתוך נמצאת על
+        // שני הקווים, כך שהזזת הקצה הקרוב אליה שומרת על כיוון (יישור) שני הקירות.
+        const X = lineIntersect(A.x1, A.y1, adx, ady, B.x1, B.y1, bdx, bdy);
+        const mx = X ? X.x : (best.ae[0] + best.be[0]) / 2;
+        const my = X ? X.y : (best.ae[1] + best.be[1]) / 2;
+        if (best.ae[2] === 1) {
+          A.x1 = mx;
+          A.y1 = my;
+        } else {
+          A.x2 = mx;
+          A.y2 = my;
+        }
+        if (best.be[2] === 1) {
+          B.x1 = mx;
+          B.y1 = my;
+        } else {
+          B.x2 = mx;
+          B.y2 = my;
+        }
+      }
+    }
+  }
+}
+
+// --- שער ייצוב-תמונה בסחרור --------------------------------------------------
+// ראה RADAR_SPIN_RATE_DEG_S. בזמן סיבוב במקום הנקודות הישנות (השמורות במסגרת-עולם)
+// היו מסתובבות סביב הסירה בתצוגה החרטום-למעלה, ובחומרה אמיתית גם נמרחות כי
+// ה-heading (dead-reckoning) לא אמין. לכן בזמן ייצוב מקפיאים את הצבירה ומשאירים
+// את התמונה האחרונה על המסך — מצוירת דהוי וקפואה סביב ה-heading שנתפס בתחילת
+// הסחרור (radarFreezeHeading), כך שהיא לא מסתובבת. כשהתמונה מתייצבת שוב הצבירה
+// והציור החי חוזרים כרגיל.
+let radarSpinning = false;
+let radarSettleUntil = 0;
+let radarFreezeHeading = 0; // ה-heading שנתפס בתחילת הסחרור, לציור התמונה האחרונה קפואה
+let radarFreshFramesSinceSpin = RADAR_SETTLE_MIN_FRAMES; // פריימי-טלמטריה טריים שהצטברו מאז שהסיבוב נעצר (מתחיל "רווי" כדי שהתמונה תיחשב יציבה לפני הסיבוב הראשון)
+
+// האם תמונת המכ"ם יציבה כעת? שלושה תנאים: (1) לא מסתחררים; (2) חלף מינימום זמן-הקיר
+// אחרי שהסיבוב נעצר; (3) הצטברו מספיק פריימי-טלמטריה טריים מאז — כדי שבקישור איטי
+// ההמתנה תתארך עד שיש באמת נתונים לבנות תמונה, ולא רק שיעבור זמן.
+function radarPictureStable() {
+  return (
+    !radarSpinning &&
+    performance.now() >= radarSettleUntil &&
+    radarFreshFramesSinceSpin >= RADAR_SETTLE_MIN_FRAMES
+  );
+}
+
+// מעדכן את מצב-הסחרור מקצב-הפוזה המוערך. מחזיר true אם מסתחררים כעת. ברגע-העלייה
+// לסחרור תופס את ה-heading הנוכחי (כדי לצייר את התמונה האחרונה קפואה) ומנקה את
+// liveScan (נתוני-ניווט) כדי שהאוטונומיה לא תפעל על זווית ישנה; התמונה עצמה
+// (radarMemory/קירות) נשמרת ומוצגת דהויה. יש היסטרזיס (חצי-סף) נגד ריצוד סביב הסף.
+function updateRadarSpinState() {
+  const rateDegS = Math.abs(state.pose.turnRateRadS) * 180 / Math.PI;
+  const now = performance.now();
+  if (!radarSpinning && rateDegS >= RADAR_SPIN_RATE_DEG_S) {
+    radarSpinning = true;
+    radarFreezeHeading = state.pose.headingDeg; // תופסים כיוון כדי שהתמונה לא תסתובב
+    radarFreshFramesSinceSpin = 0; // מתחילים לספור מחדש פריימים טריים אחרי הסחרור
+    liveScan.clear(); // נתוני-ניווט בלבד — לא לפעול על זווית ישנה בזמן סחרור
+    // חומרה אמיתית: ה-heading הוא dead-reckoning ואינו מסוגל לעקוב אחרי סיבוב
+    // במקום, כך שהתמונה הצבורה במסגרת-עולם הייתה "נמרחת"/מסתובבת שגוי כשהצבירה
+    // חוזרת (מיזוג פריימים לא-תואמים). מכיוון שאחרי כל סיבוב הסירה ממילא עוצרת
+    // וממתינה לסריקה טרייה — מוחקים את התמונה בתחילת הסחרור ובונים אותה מחדש
+    // נקי מהסריקה שאחרי, במקום למרוח. (בסימולטור ה-heading אמין, אז לא נוגעים.)
+    if (!state.mockEnabled) {
+      radarMemory.clear();
+      resetRadarWalls();
+    }
+  } else if (radarSpinning && rateDegS <= RADAR_SPIN_RATE_DEG_S * 0.5) {
+    radarSpinning = false;
+  }
+  // כל עוד מסתחררים (או ברגע-העלייה) דוחפים את חלון-ההתייצבות קדימה, כך שהוא
+  // מתחיל לספור רק מרגע שהסחרור נעצר בפועל.
+  if (radarSpinning) radarSettleUntil = now + RADAR_SETTLE_MS;
+  return radarSpinning;
 }
 
 function updateRadarMemory() {
@@ -2989,6 +4019,22 @@ function updateRadarMemory() {
   // tracks real time. When frames stop, this stops advancing and the display
   // ageing clock freezes, keeping the last radar picture visible.
   lastRadarFreshAt = now;
+  // בזמן ייצוב (סחרור + חלון-ההתייצבות) מקפיאים את הצבירה: לא מוסיפים/מעדכנים
+  // נקודות, כדי שהתמונה האחרונה תישאר כפי שהייתה (מצוירת דהויה וקפואה — ראה
+  // drawSensorArcs) ולא תסתובב סביב הסירה. עדיין מקדמים את מצב הגַּאפ-פיל כדי
+  // שלא ימלא פער-ענק ברגע שהצבירה חוזרת.
+  updateRadarSpinState();
+  // סופרים פריימי-טלמטריה טריים שהגיעו כשלא מסתחררים — כך radarPictureStable
+  // ידע שהצטברו מספיק נתונים לבנות תמונה מחדש אחרי סיבוב (לא רק שעבר זמן-קיר).
+  if (!radarSpinning && radarFreshFramesSinceSpin < RADAR_SETTLE_MIN_FRAMES) {
+    radarFreshFramesSinceSpin += 1;
+  }
+  if (!radarPictureStable()) {
+    prevSweepDeg = sweep;
+    prevSweepT = now;
+    for (const beam of SENSOR_BEAMS) prevBeamVal[beam.key] = state.telemetry[beam.key];
+    return;
+  }
   // --- Angular gap-fill (real HW only, DISPLAY-only) ----------------------
   // The servo sweeps a full arc ~1×/s but RF delivers only ~1-3 packets/s, so
   // most swept angles never arrive and the picture strobes. When a new packet
@@ -3013,6 +4059,7 @@ function updateRadarMemory() {
         const s = prevSweepDeg + dir * i * RADAR_GAPFILL_STEP_DEG;
         const frac = (s - prevSweepDeg) / span; // 0..1
         for (const beam of SENSOR_BEAMS) {
+          if (MASK_FRONT_DISPLAY && beam.masked) continue; // חיישן פגום — לא ממלא פערים בתצוגה
           const pv = prevBeamVal[beam.key];
           const nv = state.telemetry[beam.key];
           if (pv == null || nv == null || pv >= 999 || nv >= 999) continue;
@@ -3033,6 +4080,7 @@ function updateRadarMemory() {
     }
   }
   for (const beam of SENSOR_BEAMS) {
+    if (MASK_FRONT_DISPLAY && beam.masked) continue; // חיישן פגום — לא מצויר בתמונה
     const absSlot = normalizeDeg(heading + beam.dir + sweep);
     const newVal = state.telemetry[beam.key];
     if (newVal == null) continue;
@@ -3075,15 +4123,24 @@ function pruneRadarMemory() {
 
 function drawSensorArcs(cx, cy, maxR) {
   pruneRadarMemory();
-
-  // radarMemory holds each detection at the bearing/range where it was measured.
-  // The dots are drawn boat-fixed: they do NOT slide as the boat advances (that
-  // motion-simulation is intentionally disabled) — a dot simply stays put until
-  // its TTL expires (pruneRadarMemory) and it is deleted on its own. Rotation is
-  // still reflected via (absBearing - heading) so the bow stays pointing up.
-  const heading = state.pose.headingDeg;
-  const bx = state.pose.x;
-  const by = state.pose.y;
+  // radarMemory holds each detection at the world point where it was measured
+  // (entry.wx/wy). In MOCK (accurate pose) the dots are drawn WORLD-ANCHORED —
+  // reprojected from the current pose like the world-frame walls + the
+  // accumulated map — so the picture flows continuously as the boat moves and the
+  // dots sit exactly where the boat really is. On REAL HW the dead-reckoned pose
+  // is unreliable, so dots stay boat-fixed (bearing, range) to match the
+  // boat-fixed walls there. Rotation is reflected via (bearing - heading) so the
+  // bow stays pointing up.
+  // בזמן ייצוב (סחרור) מציירים סביב ה-heading שנתפס בתחילת הסחרור, כך שהתמונה
+  // האחרונה נשארת קפואה ולא מסתובבת סביב הסירה, ובעוצמת-צבע דהויה (fade).
+  const stable = radarPictureStable();
+  const heading = stable ? state.pose.headingDeg : radarFreezeHeading;
+  const fade = stable ? 1 : 0.35;
+  // Match updateRadarWalls: on real HW the walls are stored in the boat-fixed
+  // frame (position zeroed), so reproject them with the same zeroed position or
+  // they'd slide off the boat-fixed dots. Simulator keeps the true pose.
+  const bx = state.mockEnabled ? state.pose.x : 0;
+  const by = state.mockEnabled ? state.pose.y : 0;
 
   // Collect the currently valid detections as points at their true
   // (bearing, distance) location, so a straight wall lands on a straight line
@@ -3093,15 +4150,24 @@ function drawSensorArcs(cx, cy, maxR) {
     if (!entry.value || entry.value >= 999) continue;
     const dist = entry.value;
     if (dist > sim.maxRange) continue;
-    const absBearing = absSlot;
-    const pixelDist = (dist / sim.maxRange) * maxR;
-    // Center the picture on the sweep midpoint so a sensor's mid-sweep (= the
-    // bow for the front sensor) points straight up and scans symmetrically
-    // right-left, instead of sweeping off to one side.
-    const relSlot = normalizeDeg(absBearing - heading - SWEEP_CENTER_DEG);
+    let relSlot;
+    let pixelDist;
+    if (state.mockEnabled && entry.wx != null) {
+      // World-anchored: reproject the FROZEN world point from the current pose, so
+      // the dot stays put in the world and the picture flows instead of dragging.
+      const dx = entry.wx - bx;
+      const dy = entry.wy - by;
+      pixelDist = (Math.min(Math.hypot(dx, dy), sim.maxRange) / sim.maxRange) * maxR;
+      relSlot = normalizeDeg((Math.atan2(dx, dy) * 180) / Math.PI - heading - SWEEP_CENTER_DEG);
+    } else {
+      // Real HW: boat-fixed (bearing, range), matching the boat-fixed walls.
+      // Center on the sweep midpoint so the bow points straight up.
+      pixelDist = (dist / sim.maxRange) * maxR;
+      relSlot = normalizeDeg(absSlot - heading - SWEEP_CENTER_DEG);
+    }
     const rad = degToRad(relSlot) - Math.PI / 2;
     points.push({
-      slot: absBearing,
+      slot: absSlot,
       dist,
       x: cx + Math.cos(rad) * pixelDist,
       y: cy + Math.sin(rad) * pixelDist,
@@ -3141,23 +4207,35 @@ function drawSensorArcs(cx, cy, maxR) {
     const pixelDist = (Math.min(dist, sim.maxRange) / sim.maxRange) * maxR;
     return { x: cx + Math.cos(rad) * pixelDist, y: cy + Math.sin(rad) * pixelDist };
   };
-  radarCtx.strokeStyle = "rgba(44, 255, 197, 0.85)";
+  radarCtx.strokeStyle = `rgba(44, 255, 197, ${0.85 * fade})`;
   radarCtx.lineWidth = 3;
   radarCtx.lineCap = "round";
   const now = radarClock();
+  // Draw each fitted wall at its OBSERVED extent. We deliberately do NOT extend
+  // free ends out to the range edge: the real world is made of BOUNDED segments
+  // (baffles 1 m long; the pool boundary reaches the range on its own where the
+  // samples actually reach it), and artificially running every free end to the
+  // range circle turned the picture into rays from the boat instead of the
+  // rectangular world. "No floating wall" is enforced by REJECTING isolated noise
+  // segments in updateRadarWalls, not by extending real ones. Interior coverage
+  // gaps >40 cm are drawn as BREAKS via w.runs (fractions along w.x1..w.y2), so a
+  // real passage never gets a line stretched across it.
   for (const [, w] of radarWalls) {
     if (now - w.t > WALL_TTL_MS) continue;
-    const a = wallToPixel(w.x1, w.y1);
-    const b = wallToPixel(w.x2, w.y2);
-    radarCtx.beginPath();
-    radarCtx.moveTo(a.x, a.y);
-    radarCtx.lineTo(b.x, b.y);
-    radarCtx.stroke();
+    const runs = w.runs && w.runs.length ? w.runs : [[0, 1]];
+    for (const [f0, f1] of runs) {
+      const a = wallToPixel(w.x1 + (w.x2 - w.x1) * f0, w.y1 + (w.y2 - w.y1) * f0);
+      const b = wallToPixel(w.x1 + (w.x2 - w.x1) * f1, w.y1 + (w.y2 - w.y1) * f1);
+      radarCtx.beginPath();
+      radarCtx.moveTo(a.x, a.y);
+      radarCtx.lineTo(b.x, b.y);
+      radarCtx.stroke();
+    }
   }
 
   // Draw each raw detection as a faint blip on top, so the underlying returns
   // are still visible behind the smoothed wall line.
-  radarCtx.fillStyle = "rgba(44, 255, 197, 0.6)";
+  radarCtx.fillStyle = `rgba(44, 255, 197, ${0.6 * fade})`;
   for (const p of signal) {
     radarCtx.beginPath();
     radarCtx.arc(p.x, p.y, 2, 0, Math.PI * 2);

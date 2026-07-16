@@ -299,6 +299,46 @@ button:disabled {
   margin-top: 14px;
 }
 
+.replay-panel {
+  padding: 12px;
+}
+
+.replay-status {
+  font-size: 0.85rem;
+  color: var(--text-soft);
+}
+
+.replay-hint {
+  margin: 0 0 12px;
+  font-size: 0.85rem;
+  color: var(--text-soft);
+}
+
+.replay-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.replay-controls select {
+  flex: 1 1 200px;
+  min-width: 160px;
+}
+
+.replay-loop {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-soft);
+  font-size: 0.85rem;
+}
+
+.replay-controls button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .motor-speed-hint {
   margin: 0 0 10px;
   font-size: 0.85rem;

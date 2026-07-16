@@ -86,8 +86,8 @@
                 <div id="joystickStick" class="joystick-stick"></div>
               </div>
               <div class="telemetry-mini">
-                <span>שמאל: <strong id="leftSpeedValue">0</strong></span>
-                <span>ימין: <strong id="rightSpeedValue">0</strong></span>
+                <span>שמאל: <strong id="leftSpeedValue">מנוחה</strong></span>
+                <span>ימין: <strong id="rightSpeedValue">מנוחה</strong></span>
               </div>
             </article>
 
@@ -111,19 +111,40 @@
             <h3>מהירות מנועים</h3>
             <p class="motor-speed-hint">מהירות מוחלטת (0–100) שכל מנוע נוסע בה כשהוא פועל.</p>
             <div class="motor-speed-row">
-              <label for="motorLeftAbs">מנוע שמאל</label>
+              <label for="motorLeftAbs">מנוע ימין</label>
               <input id="motorLeftAbs" type="number" min="0" max="100" step="1" inputmode="numeric" />
             </div>
             <div class="motor-speed-row">
-              <label for="motorRightAbs">מנוע ימין</label>
+              <label for="motorRightAbs">מנוע שמאל</label>
               <input id="motorRightAbs" type="number" min="0" max="100" step="1" inputmode="numeric" />
             </div>
           </article>
         </div>
       </section>
+
+      <section class="panel replay-panel">
+        <div class="panel-header">
+          <h2>ניגון מסלול מוקלט</h2>
+          <span id="replayStatus" class="replay-status">לא מנגן</span>
+        </div>
+        <p class="replay-hint">
+          כל נסיעה מוקלטת אוטומטית (פקודות + נתוני חיישנים). בחר מסלול והפעל
+          "נגן" כדי שהסירה תבצע אותו פיזית מחדש.
+        </p>
+        <div class="replay-controls">
+          <select id="replaySelect" aria-label="מסלול מוקלט"></select>
+          <button id="replayRefreshBtn" type="button" class="mini-btn">רענן</button>
+          <button id="replayPlayBtn" type="button" class="primary">נגן</button>
+          <button id="replayStopBtn" type="button">עצור</button>
+          <label class="replay-loop" for="replayLoopChk">
+            <input id="replayLoopChk" type="checkbox" />
+            <span>לולאה</span>
+          </label>
+        </div>
+      </section>
     </main>
 
-    <script src="./serial-bridge.js" defer></script>
-    <script src="./app.js" defer></script>
+    <script src="./serial-bridge.js?v=20260716a" defer></script>
+    <script src="./app.js?v=20260716q-proto16" defer></script>
   </body>
 </html>
