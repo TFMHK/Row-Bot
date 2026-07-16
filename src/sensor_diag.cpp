@@ -7,7 +7,7 @@
 
 const int US_TRIG_PIN = 2;          // טריגר משותף
 const int US_ECHO_RADAR_PIN = A5;   // אחורה
-const int US_ECHO_FRONT_PIN = A0;   // קדימה
+const int US_ECHO_FRONT_PIN = A1;   // קדימה
 const int US_ECHO_LEFT_PIN  = A2;   // שמאל
 const int US_ECHO_RIGHT_PIN = A4;   // ימין
 
@@ -63,16 +63,16 @@ void setup() {
   pinMode(US_ECHO_FRONT_PIN, INPUT);
   pinMode(US_ECHO_LEFT_PIN, INPUT);
   pinMode(US_ECHO_RIGHT_PIN, INPUT);
-  Serial.println(F("SENSOR DIAG ready. cols: FRONT(A0) RIGHT(A4) BACK(A5) LEFT(A2)"));
+  Serial.println(F("SENSOR DIAG ready. cols: FRONT(A1) RIGHT(A4) BACK(A5) LEFT(A2)"));
 }
 
 void loop() {
   int r[4];
   readAllUltrasonic(r);
-  // r[0]=back(A5) r[1]=front(A0) r[2]=left(A2) r[3]=right(A4)
+  // r[0]=back(A5) r[1]=front(A1) r[2]=left(A2) r[3]=right(A4)
   char line[80];
   snprintf(line, sizeof(line),
-           "FRONT(A0)=%4d  RIGHT(A4)=%4d  BACK(A5)=%4d  LEFT(A2)=%4d",
+           "FRONT(A1)=%4d  RIGHT(A4)=%4d  BACK(A5)=%4d  LEFT(A2)=%4d",
            r[1], r[3], r[0], r[2]);
   Serial.println(line);
   delay(180);

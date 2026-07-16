@@ -603,9 +603,12 @@ class SerialBridge:
                     self._state.lastError = ""
                     continue
 
+                # HW-compensation: the front (usFront) and rear (usRadar)
+                # ultrasonic sensors are physically swapped on the boat, so the
+                # rear field reads the front echo (values[1]) and vice versa.
                 self._state.telemetry = Telemetry(
-                    usRadar=self._smooth_reading("usRadar", filter_near_reading(values[0])),
-                    usFront=self._smooth_reading("usFront", filter_near_reading(values[1])),
+                    usRadar=self._smooth_reading("usRadar", filter_near_reading(values[1])),
+                    usFront=self._smooth_reading("usFront", filter_near_reading(values[0])),
                     usLeft=self._smooth_reading("usLeft", filter_near_reading(values[2])),
                     usRight=self._smooth_reading("usRight", filter_near_reading(values[3])),
                     radarAngle=values[4],

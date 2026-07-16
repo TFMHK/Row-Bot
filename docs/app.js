@@ -2349,6 +2349,7 @@ const PROTO_SPIN_PULSE_MS = 150;    // ONE short rotate pulse (holds ~1 control 
 const PROTO_SETTLE_MS = 550;        // after a pulse: STOP this long so rotation dies + a fresh scan arrives, THEN re-decide
 const PROTO_EMERGENCY_CM = 40;      // wall closer than this DEAD AHEAD -> back up (the only allowed reverse). Raised so it retreats from farther and never grinds head-on into the wall.
 const PROTO_DEAD_HALF_DEG = 25;     // half-cone treated as "directly in front of the bow" for the emergency check. Kept below +30 so usRight (bowRel ~30+servo with bow fixed at 60) never leaks into the front dead cone and triggers an endless false reverse.
+const PROTO_FRONT_RAW_BLOCK_CM = 40; // RAW usFront (the physical front sensor, ~dead ahead) below this => a wall is imminent DIRECTLY ahead => back up. COLLISION SAFETY NET that BYPASSES the bow-relative liveScan binning: verified from real logs that usFront measured a wall at 12-38cm while the binned front cone read 120-200cm "open" (the front reading fell into a side bin via the bow-offset geometry, so the boat drove straight into a wall it had literally measured). Trusting the raw front sensor prevents that. Kept just below the ~40-60cm water-reflection floor so open water (which reflects ~50cm off the surface) still lets the boat drive.
 const PROTO_REVERSE_MS = 250;       // how long the emergency back-up lasts (~0.25 second)
 const PROTO_SIDE_CM = 30;           // wall closer than this on a SIDE -> run that side's motor ~1s to push the bow away (raised +5cm so the boat keeps more clearance from side walls)
 const PROTO_SIDE_TOL_DEG = 35;      // ± tolerance around ±90° for the side check
@@ -2382,7 +2383,13 @@ function protoBestGap(loDeg, hiDeg) {
     const c = liveCone(b, PROTO_BIN_DEG * 0.8);
     if (c.count === 0) continue;
     any = true;
-    if (c.median > best) {
+    // Prefer the more-open bearing; on a TIE prefer the one CLOSEST to the bow
+    // (smaller |b|). Without this the loop scans from the leftmost bin upward with
+    // a strict '>', so when the whole front is uniformly open (every bin reads the
+    // same capped max, e.g. open water) the FIRST (leftmost, -60°) bin wins the tie
+    // and the boat veers LEFT on every start. Nearest-to-bow tie-break makes an
+    // open/symmetric front resolve to ~0° => drive straight instead of turning.
+    if (c.median > best || (c.median === best && Math.abs(b) < Math.abs(bestB))) {
       best = c.median;
       bestB = b;
     }
@@ -2423,11 +2430,37 @@ function updateAutonomousProto() {
     state.cmd.rightSpeed = PROTO_SPEED;
     return;
   }
+  // 0b-raw) COLLISION SAFETY NET on the RAW front sensor. usFront points ~dead
+  //     ahead and its raw reading is immune to the bow-offset liveScan binning
+  //     that can misplace a real wall into a SIDE bin (leaving the front cone
+  //     falsely "open"). If the physical front sensor measures a wall closer
+  //     than PROTO_FRONT_RAW_BLOCK_CM, back up instead of ever driving forward
+  //     into it. No-echo (999) and open water (>= block) pass through untouched.
+  const rawFront = state.telemetry ? state.telemetry.usFront : null;
+  if (typeof rawFront === "number" && rawFront > 0 && rawFront < PROTO_FRONT_RAW_BLOCK_CM) {
+    const rear = liveCone(180, PROTO_REAR_TOL_DEG);
+    if (rear.count > 0 && rear.min < PROTO_REAR_CM) {
+      // Wall ahead AND behind -> can't back up; pulse forward briefly to slip out.
+      state.nav.reverseUntil = 0;
+      state.nav.fwdUntil = now + PROTO_FWD_PULSE_MS;
+      state.avoidDir = 0;
+      state.cmd.leftSpeed = PROTO_SPEED;
+      state.cmd.rightSpeed = PROTO_SPEED;
+      return;
+    }
+    state.nav.reverseUntil = now + PROTO_REVERSE_MS;
+    state.nav.spinUntil = 0;
+    state.nav.settleUntil = 0;
+    state.nav.sideUntil = 0;
+    state.avoidDir = 0;
+    state.cmd.leftSpeed = -PROTO_SPEED;
+    state.cmd.rightSpeed = -PROTO_SPEED;
+    return;
+  }
   // 0b) Wall closer than PROTO_EMERGENCY_CM DIRECTLY in front of the bow -> back
   //     straight for ~1 second, cancelling any rotate pulse/settle in progress.
   const dead = liveCone(0, PROTO_DEAD_HALF_DEG);
-  if (dead.count > 0 && dead.min < PROTO_EMERGENCY_CM) {
-    state.nav.reverseUntil = now + PROTO_REVERSE_MS;
+  if (dead.count > 0 && dead.min < PROTO_EMERGENCY_CM) {    state.nav.reverseUntil = now + PROTO_REVERSE_MS;
     state.nav.spinUntil = 0;
     state.nav.settleUntil = 0;
     state.avoidDir = 0;
@@ -3361,7 +3394,7 @@ const SENSOR_BEAMS = [
   { dir: 270, key: "usLeft", color: "rgba(100, 200, 255, 1)" },
 ];
 
-// חיישן החזית (usFront / echo A0) פגום: כשהחרטום פתוח הוא מחזיר ~65 ס"מ כמעט-קבוע
+// חיישן החזית (usFront / echo A1) פגום: כשהחרטום פתוח הוא מחזיר ~65 ס"מ כמעט-קבוע
 // (החזר ממשטח המים כי הוא מוטה מעט מטה). אבל חיישן אולטרסוני מדווח את ההד הקרוב
 // ביותר, ולכן קיר אמיתי קרוב מ~65 ס"מ *כן* מדווח נכון. לכן: לניווט הוא לא ממוסך
 // (RW_BLOCK_CM מוגדר מתחת לרצועת החזר-המים כך שמים פתוחים לא יבלמו שקר, אבל קיר

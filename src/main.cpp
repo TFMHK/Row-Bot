@@ -47,11 +47,11 @@ Servo netServo;
 // 0 = מרכז/ניטרלי (90°). מתאים לסרוו זוויתי וגם לסרוו רציף (90=עצירה).
 const int NET_SERVO_NEUTRAL = 90;
 
-// אולטרה-סוני: טריגר משותף ו-4 קווי Echo (המכם על A0 כדי לחסוך פין D)
+// אולטרה-סוני: טריגר משותף ו-4 קווי Echo (המכם על A1 כדי לחסוך פין D)
 // הטריגר עבר מ-D5 ל-D2 כדי לפנות את D5 ל-PWM של מנוע
 const int US_TRIG_PIN = 2;
 const int US_ECHO_RADAR_PIN = A5;
-const int US_ECHO_FRONT_PIN = A0;
+const int US_ECHO_FRONT_PIN = A1;
 const int US_ECHO_LEFT_PIN = A2;
 const int US_ECHO_RIGHT_PIN = A4;
 // חלון-האזנה ל-echo. 24ms מכסה ~400ס"מ (התקרה בקוד ממילא 400ס"מ; מעבר לכך → 999),
