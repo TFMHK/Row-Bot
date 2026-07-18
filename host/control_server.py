@@ -120,6 +120,11 @@ def clamp(value: int, low: int, high: int) -> int:
 MOTOR_DEADZONE = 35        # below this magnitude -> 0 (off)
 MOTOR_LOW_SPEED = 70       # bottom of the usable band
 MOTOR_HIGH_SPEED = 100     # top of the usable band
+# Upper bound the operator may enter for each motor's absolute output speed in
+# the UI. Kept ABOVE MOTOR_HIGH_SPEED (the shaping band used by nav/mock) so the
+# operator can push a motor harder than the autonomous band without affecting
+# nav/mock physics. PWM is 8-bit (0..255) so 150 is well within range.
+MOTOR_ABS_MAX = 150
 # Absolute output speed (magnitude) each PHYSICAL drive motor runs at whenever
 # it is driving. The shaped command still decides OFF (0) vs on and the
 # direction (sign); this only overrides the magnitude, so the operator can tune
@@ -216,6 +221,22 @@ def build_serial_line(
     The logical CommandState kept in the bridge state stays unchanged, so the
     UI and mock trajectory still see left/right/winch in their intended sense.
     """
+    # AUTONOMOUS mode: the boat runs the navigator ONBOARD and decides each
+    # motor's DIRECTION locally (forward / turn / reverse). The shore only sets
+    # the per-motor POWER — so when we switch to auto we send the operator-tuned
+    # absolute speeds (positive) as the left/right fields, and the boat reads
+    # their MAGNITUDE as its autonomous drive power. The incoming leftSpeed/
+    # rightSpeed (0 from the UI in auto) are ignored here. This keeps motor
+    # calibration entirely on the shore — no reflash needed to retune it.
+    if command.mode == 1:
+        powerLeft = clamp(int(motor_left_abs), 0, MOTOR_ABS_MAX)
+        powerRight = clamp(int(motor_right_abs), 0, MOTOR_ABS_MAX)
+        physicalWinch = -command.winchSpeed
+        return (
+            f"{powerLeft},{powerRight},"
+            f"{physicalWinch},{command.radarAngle},{command.mode}\n"
+        )
+
     # Straight-through: logical left -> physical left slot, logical right -> right.
     physicalLeft = shape_motor_speed(command.leftSpeed)
     physicalRight = shape_motor_speed(command.rightSpeed)
@@ -224,10 +245,10 @@ def build_serial_line(
     # physical right motor. An already-off motor (0) stays off; the sign/direction
     # is preserved.
     if physicalLeft != 0:
-        mag = clamp(int(motor_left_abs), 0, MOTOR_HIGH_SPEED)
+        mag = clamp(int(motor_left_abs), 0, MOTOR_ABS_MAX)
         physicalLeft = mag if physicalLeft > 0 else -mag
     if physicalRight != 0:
-        mag = clamp(int(motor_right_abs), 0, MOTOR_HIGH_SPEED)
+        mag = clamp(int(motor_right_abs), 0, MOTOR_ABS_MAX)
         physicalRight = mag if physicalRight > 0 else -mag
     physicalWinch = -command.winchSpeed
     return (
@@ -524,17 +545,17 @@ class SerialBridge:
         """Update the per-motor absolute output speeds from the UI.
 
         Only the keys present in the payload are changed, each clamped to the
-        [0, MOTOR_HIGH_SPEED] range. Applied to every subsequent serial packet
+        [0, MOTOR_ABS_MAX] range. Applied to every subsequent serial packet
         (send_command + heartbeat) with no boat reflash.
         """
         with self._lock:
             if payload.get("motorLeftAbs") is not None:
                 self._state.motorLeftAbs = clamp(
-                    int(payload["motorLeftAbs"]), 0, MOTOR_HIGH_SPEED
+                    int(payload["motorLeftAbs"]), 0, MOTOR_ABS_MAX
                 )
             if payload.get("motorRightAbs") is not None:
                 self._state.motorRightAbs = clamp(
-                    int(payload["motorRightAbs"]), 0, MOTOR_HIGH_SPEED
+                    int(payload["motorRightAbs"]), 0, MOTOR_ABS_MAX
                 )
             self._publish()
             return self.snapshot()
@@ -603,12 +624,11 @@ class SerialBridge:
                     self._state.lastError = ""
                     continue
 
-                # HW-compensation: the front (usFront) and rear (usRadar)
-                # ultrasonic sensors are physically swapped on the boat, so the
-                # rear field reads the front echo (values[1]) and vice versa.
+                # Straight mapping: rear/radar echo is values[0], front is
+                # values[1] (the earlier front/rear swap has been reverted).
                 self._state.telemetry = Telemetry(
-                    usRadar=self._smooth_reading("usRadar", filter_near_reading(values[1])),
-                    usFront=self._smooth_reading("usFront", filter_near_reading(values[0])),
+                    usRadar=self._smooth_reading("usRadar", filter_near_reading(values[0])),
+                    usFront=self._smooth_reading("usFront", filter_near_reading(values[1])),
                     usLeft=self._smooth_reading("usLeft", filter_near_reading(values[2])),
                     usRight=self._smooth_reading("usRight", filter_near_reading(values[3])),
                     radarAngle=values[4],

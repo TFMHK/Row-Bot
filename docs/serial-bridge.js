@@ -28,6 +28,7 @@
   const MOTOR_DEADZONE = 35;
   const MOTOR_LOW_SPEED = 70;
   const MOTOR_HIGH_SPEED = 100;
+  const MOTOR_ABS_MAX = 150;
   const MOTOR_LEFT_ABS_DEFAULT = 84;
   const MOTOR_RIGHT_ABS_DEFAULT = 88;
 
@@ -70,11 +71,11 @@
     // motorLeftAbs governs the physical left motor (emitted on the right slot)
     // and motorRightAbs the physical right motor.
     if (physicalLeft !== 0) {
-      const mag = clamp(Math.trunc(motorRightAbs), 0, MOTOR_HIGH_SPEED);
+      const mag = clamp(Math.trunc(motorRightAbs), 0, MOTOR_ABS_MAX);
       physicalLeft = physicalLeft > 0 ? mag : -mag;
     }
     if (physicalRight !== 0) {
-      const mag = clamp(Math.trunc(motorLeftAbs), 0, MOTOR_HIGH_SPEED);
+      const mag = clamp(Math.trunc(motorLeftAbs), 0, MOTOR_ABS_MAX);
       physicalRight = physicalRight > 0 ? mag : -mag;
     }
     const physicalWinch = -command.winchSpeed;
@@ -389,10 +390,10 @@
 
     setMotorConfig(payload) {
       if (payload.motorLeftAbs != null) {
-        this._state.motorLeftAbs = clamp(Math.trunc(payload.motorLeftAbs), 0, MOTOR_HIGH_SPEED);
+        this._state.motorLeftAbs = clamp(Math.trunc(payload.motorLeftAbs), 0, MOTOR_ABS_MAX);
       }
       if (payload.motorRightAbs != null) {
-        this._state.motorRightAbs = clamp(Math.trunc(payload.motorRightAbs), 0, MOTOR_HIGH_SPEED);
+        this._state.motorRightAbs = clamp(Math.trunc(payload.motorRightAbs), 0, MOTOR_ABS_MAX);
       }
       this._publish();
       return this.snapshot();

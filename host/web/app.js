@@ -584,7 +584,7 @@ async function onMockToggle() {
 async function sendMotorConfig(key, input) {
   let value = Math.round(Number(input.value));
   if (!Number.isFinite(value)) return;
-  value = Math.max(0, Math.min(100, value));
+  value = Math.max(0, Math.min(150, value));
   input.value = String(value);
   try {
     const response = await postJson("/api/motorconfig", { [key]: value });
@@ -718,6 +718,17 @@ function startCommandLoop() {
     // ומעדכנת את הלד רק כשהערך משתנה (כך לא משבשים את קליטת ה-RF). בניגון
     // חוזר שולחים 0 (ידני) כדי שהסירה לא תריץ ניווט-על עצמאי מעל המסלול.
     outgoing.mode = (state.manualMode || state.replay.active) ? 0 : 1;
+
+    // ארכיטקטורה חדשה (ניווט על-הסיפון): במצב אוטומטי על הסירה האמיתית, לוגיקת
+    // הניווט רצה על הארדואינו של הסירה בקצב החיישנים המקומי — לא על המחשב. לכן
+    // המחשב אינו נוהג: הוא שולח mode=1 עם ערוצי מנוע באפס, ומשמש רק לתמונת שו"ב,
+    // למעבר בין מצבים ולפקודות ידניות. הסירה ממילא מתעלמת מערוצי המנוע במצב
+    // אוטומטי, אבל איפוסם כאן מונע בלבול ותעבורת-RF מיותרת. בסימולטור (mock)
+    // מנוע הניווט של ה-UI ממשיך לרוץ כרגיל לצורך בדיקות.
+    if (!state.manualMode && !state.mockEnabled && !state.replay.active) {
+      outgoing.leftSpeed = 0;
+      outgoing.rightSpeed = 0;
+    }
 
     // הקלטה רציפה: כל עוד מחוברים (ולא מנגנים מסלול קיים) רושמים כל טיק — ידני
     // או אוטונומי — כדי שאפשר יהיה לנתח ולנגן מחדש את כל הנסיעה. סשן חדש (קובץ
@@ -1243,6 +1254,9 @@ function onModeChange() {
   if (!state.manualMode) {
     state.cmd.leftSpeed = 0;
     state.cmd.rightSpeed = 0;
+    // מאתחלים את תאום הניווט המובנה (מוק) ומנקים את סריקת-הניווט כדי להתחיל נקי.
+    navTwinReset();
+    if (state.mockEnabled) liveScan.clear();
     // Real-world autonomous restarts with a fresh online bow estimate + scan.
     if (!state.mockEnabled) {
       state.nav.bowOffsetDeg = BOW_SERVO_OFFSET_DEG;
@@ -2556,7 +2570,159 @@ function startProtoPulse(dir, now) {
   state.cmd.rightSpeed = sc.right;
 }
 
+// ===== תאום המוק של הניווט המובנה (Onboard-nav twin) =====
+// שיקוף נאמן של computeAutonomousDrive מקושחת הסירה (src/main.cpp), כדי שמצב
+// המוק יבדוק את *אותה* לוגיקת החלטה שרצה בפועל על הסירה: "אם עובד במוק — יעבוד
+// במים". צורך את אותם שדות טלמטריה שהסירה קוראת מקומית (usFront/usLeft/usRight +
+// radarAngle; usRadar האחורי מושמט — שבור), דרך תפיסת ה-liveScan/liveCone
+// (bow-relative, אותו bowOffset=60 כמו הקושחה). קבועים זהים לקושחה:
+const NAV_TWIN_FRONT_HALF_DEG = 45;    // חצי-רוחב מגזר החרטום (NAV_FRONT_HALF_DEG)
+const NAV_TWIN_BLOCK_CM = 50;          // NAV_FRONT_BLOCK_CM
+const NAV_TWIN_CLEAR_CM = 75;          // NAV_FRONT_CLEAR_CM
+const NAV_TWIN_EMERGENCY_CM = 30;      // NAV_FRONT_EMERGENCY_CM
+const NAV_TWIN_SCAN_HALF_DEG = 90;     // NAV_SCAN_HALF_DEG (סורקים ±90° לחיפוש הפער העמוק)
+const NAV_TWIN_ALIGN_DEG = 20;         // NAV_ALIGN_DEG (חרטום מיושר עם הפער => נוסעים)
+const NAV_TWIN_GAP_WINDOW_DEG = 22;    // NAV_GAP_WINDOW_DEG (חצי-חלון החרוט סביב כל מועמד)
+const NAV_TWIN_REVERSE_BURST_MS = 600; // NAV_REVERSE_BURST_MS
+const NAV_TWIN_SECTOR_TTL_MS = 2000;   // NAV_SECTOR_TTL_MS
+// עוצמה נומינלית: shapeMotorSpeed ממפה לרצועת הכוח, והמוק גוזר כיוון בלבד (כמו
+// שהחוף קובע את העוצמה בפועל בסירה) — כך שהמספר עצמו לא משנה, רק הסימן.
+const NAV_TWIN_PWM = 100;
+
+// מצב התאום: מפת-מרחק לפי כיוון (bearing) — 24 תאים ברזולוציית 15°, זהה למפת
+// התאים בקושחה (navBinDist/navBinT). קיר דק שנתפס בזווית-סרוו אחת נשאר בתא שלו
+// לאורך ה-TTL ואינו נמחק ע"י "פתוח" מזווית סמוכה (תא נפרד) — כך לא נוסעים דרכו.
+// בונה מפה משלו מהטלמטריה הגולמית (לא liveScan, שמסנן את החזר-המים של usFront
+// ולכן היה מפספס קיר אמיתי ב-38-60ס"מ שהקושחה הגולמית כן רואה).
+const NAV_TWIN_BINS = 24;
+const NAV_TWIN_BIN_DEG = 15;
+const navTwin = {
+  turning: false, turnDir: 1, reverseUntil: 0,
+  binDist: new Array(NAV_TWIN_BINS).fill(999),
+  binT: new Array(NAV_TWIN_BINS).fill(0),
+};
+function navTwinReset() {
+  navTwin.turning = false;
+  navTwin.turnDir = 1;
+  navTwin.reverseUntil = 0;
+  navTwin.binDist.fill(999);
+  navTwin.binT.fill(0);
+}
+
+// שיקוף navIngest: לכל חיישן (למעט האחורי השבור usRadar) מחשב זווית ביחס לחרטום
+// מזווית הסרוו (bowRel = beam.dir + servo - bowOff, זהה לקושחה) ושומר את המרחק
+// הגולמי בתא המתאים. "אין הד" (999) נשמר גם הוא (פתוח בטווח מרבי, לא "לא ידוע").
+function navTwinIngest() {
+  const servo = state.telemetry.radarAngle ?? state.cmd.radarAngle ?? 0;
+  const bowOff = state.nav.bowOffsetDeg ?? BOW_SERVO_OFFSET_DEG;
+  const now = performance.now();
+  for (const beam of SENSOR_BEAMS) {
+    if (beam.key === "usRadar") continue; // חיישן אחורי שבור — מתעלמים
+    const raw = state.telemetry[beam.key];
+    if (raw == null || raw < 0) continue;
+    const m = raw <= 0 || raw > 999 ? 999 : raw;
+    const bearing = normalizeDeg(beam.dir + servo - bowOff);
+    const bin = ((Math.round(bearing / NAV_TWIN_BIN_DEG) % NAV_TWIN_BINS) + NAV_TWIN_BINS) % NAV_TWIN_BINS;
+    navTwin.binDist[bin] = m;
+    navTwin.binT[bin] = now;
+  }
+}
+
+// המרחק הקרוב ביותר (מינימום) על-פני התאים הטריים בחרוט [center±half]. מחזיר
+// {min, any} — any=false אם אין אף תא טרי בחרוט (=> "לא ידוע").
+function navTwinConeMin(centerDeg, halfDeg, now) {
+  let best = 999;
+  let any = false;
+  for (let i = 0; i < NAV_TWIN_BINS; i++) {
+    if (navTwin.binT[i] === 0) continue;
+    if (now - navTwin.binT[i] > NAV_TWIN_SECTOR_TTL_MS) continue;
+    const binBearing = normalizeDeg(i * NAV_TWIN_BIN_DEG);
+    if (Math.abs(normalizeDeg(binBearing - centerDeg)) > halfDeg) continue;
+    any = true;
+    if (navTwin.binDist[i] < best) best = navTwin.binDist[i];
+  }
+  return { min: best, any };
+}
+
+// מוצא את הכיוון ה"פתוח ביותר" בקשת [lo,hi] (שיקוף navDeepest בקושחה): לכל
+// כיוון-מועמד בצעדי 15° מחשב את המרחק הפנוי בחרוט סביבו ובוחר את הגדול ביותר;
+// שובר-שוויון לכיוון הקרוב לחרטום. מחזיר {bearing, clear} (clear=-1 אם אין נתון).
+function navTwinDeepest(loDeg, hiDeg, now) {
+  let best = -1;
+  let bestB = 0;
+  for (let b = loDeg; b <= hiDeg + 0.5; b += NAV_TWIN_BIN_DEG) {
+    const c = navTwinConeMin(b, NAV_TWIN_GAP_WINDOW_DEG, now);
+    if (!c.any) continue;
+    if (c.min > best || (c.min === best && Math.abs(b) < Math.abs(bestB))) { best = c.min; bestB = b; }
+  }
+  return { bearing: bestB, clear: best };
+}
+
+// סיבוב-במקום לעבר dir (+1=חרטום ימינה, -1=שמאלה) לפי מוסכמת המנועים של המוק
+// (turn=ימין-שמאל: ימין קדימה+שמאל אחורה => פנייה ימינה). זו הפונקציה שמתרגמת
+// את החלטת "לאיזה צד לפנות" לתנועה נכונה בסימולטור; מוסכמת הסימנים הפיזית על
+// הסירה (NAV_SWEEP_SIGN + חיווט) מכוילת בנפרד ביבשה.
+function navTwinSpin(dir) {
+  if (dir > 0) { state.cmd.leftSpeed = -NAV_TWIN_PWM; state.cmd.rightSpeed = NAV_TWIN_PWM; }
+  else         { state.cmd.leftSpeed = NAV_TWIN_PWM;  state.cmd.rightSpeed = -NAV_TWIN_PWM; }
+}
+
+// שיקוף computeAutonomousDrive: נסיעה קדימה בחרטום פנוי; סיבוב-במקום לצד הפתוח
+// כשחסום (היסטרזיס); פרץ נסיעה-לאחור בסכנת התנגשות קרובה; עצירה כשאין נתון קדמי.
+// שיקוף computeAutonomousDrive (עקוב-אחר-הפער): מכוונים אל הכיוון הפתוח ביותר
+// בקשת הקדמית ונוסעים רק כשהחרטום מיושר איתו; אחרת מסתובבים אליו. "קופסה" + חזית
+// קרובה => פרץ נסיעה לאחור. אין נתון קדמי טרי => עצירה.
+function updateOnboardNavTwin() {
+  const now = performance.now();
+  navTwinIngest();
+
+  // 0) פרץ נסיעה-לאחור מחויב
+  if (now < navTwin.reverseUntil) {
+    state.cmd.leftSpeed = -NAV_TWIN_PWM; state.cmd.rightSpeed = -NAV_TWIN_PWM; return;
+  }
+
+  const fc = navTwinConeMin(0, NAV_TWIN_FRONT_HALF_DEG, now);
+  if (!fc.any) { state.cmd.leftSpeed = 0; state.cmd.rightSpeed = 0; return; } // אין נתון קדמי טרי
+  const front = fc.min;
+
+  const fwd = navTwinDeepest(-NAV_TWIN_SCAN_HALF_DEG, NAV_TWIN_SCAN_HALF_DEG, now); // פער בקשת הקדמית
+  const all = navTwinDeepest(-180, 180, now);                                       // פער בכל כיוון
+
+  // 1) התחייבות-לסיבוב (היסטרזיס): ממשיכים עד שהפער מיושר עם החרטום והחזית פנויה.
+  if (navTwin.turning) {
+    if (Math.abs(fwd.bearing) <= NAV_TWIN_ALIGN_DEG && front >= NAV_TWIN_BLOCK_CM) navTwin.turning = false;
+    else { navTwinSpin(navTwin.turnDir); return; }
+  }
+
+  // 2) הפער מיושר עם החרטום והחזית פנויה => נסיעה קדימה.
+  if (front >= NAV_TWIN_BLOCK_CM && Math.abs(fwd.bearing) <= NAV_TWIN_ALIGN_DEG) {
+    state.cmd.leftSpeed = NAV_TWIN_PWM; state.cmd.rightSpeed = NAV_TWIN_PWM; return;
+  }
+
+  // 3) צריך לפנות: יעד = הפער הקדמי אם פתוח מספיק, אחרת הפער הטוב בכל כיוון.
+  let target;
+  if (fwd.clear >= NAV_TWIN_BLOCK_CM) target = fwd.bearing;
+  else if (all.clear >= NAV_TWIN_BLOCK_CM) target = all.bearing;
+  else {
+    // "קופסה": שום כיוון אינו פתוח. אם החזית קרובה מסוכן => פרץ נסיעה לאחור.
+    if (front < NAV_TWIN_EMERGENCY_CM) {
+      navTwin.reverseUntil = now + NAV_TWIN_REVERSE_BURST_MS;
+      state.cmd.leftSpeed = -NAV_TWIN_PWM; state.cmd.rightSpeed = -NAV_TWIN_PWM; return;
+    }
+    target = all.bearing;
+  }
+  navTwin.turnDir = target >= 0 ? 1 : -1;  // סיבוב לעבר הפער
+  navTwin.turning = true;
+  navTwinSpin(navTwin.turnDir); return;
+}
+
 function updateAutonomousCommand() {
+  // מצב מוק: מריצים את תאום הניווט המובנה (שיקוף קושחת הסירה) כדי לבדוק את אותה
+  // לוגיקה שתרוץ במים. הסטאק המתוחכם/פרוטו למטה כבר לא מייצג את הסירה האמיתית.
+  if (state.mockEnabled) {
+    updateOnboardNavTwin();
+    return;
+  }
   // Prototype navigator (forward-only, drive-to-the-biggest-front-gap) takes over
   // BOTH in mock and on real hardware when enabled, so it can be evaluated safely
   // in the simulator and behaves identically on the water. The sophisticated
@@ -2680,6 +2846,15 @@ function computeSafeCommand() {
   // בשליטה ידנית — מנטרלים (בינתיים) את הגבלת הקרבה: הפקודה נשלחת כמות שהיא
   // ללא דריסת בטיחות. מושל המהירות/ההתחמקות פעילים רק בניווט האוטונומי.
   if (state.manualMode) {
+    cmd.leftSpeed = shapeMotorSpeed(cmd.leftSpeed);
+    cmd.rightSpeed = shapeMotorSpeed(cmd.rightSpeed);
+    return cmd;
+  }
+
+  // מוק: תאום הניווט המובנה (updateOnboardNavTwin) כבר קבע left/right כשיקוף של
+  // הקושחה, שהיא הלוגיקה השלמה — אין לקושחה דריסת-בטיחות נוספת מעל. לכן מעבירים
+  // את הפקודה כמו-שהיא (רק עיצוב לרצועת הכוח) בלי הדריסה של הנתיב הסימולטיבי הישן.
+  if (state.mockEnabled) {
     cmd.leftSpeed = shapeMotorSpeed(cmd.leftSpeed);
     cmd.rightSpeed = shapeMotorSpeed(cmd.rightSpeed);
     return cmd;

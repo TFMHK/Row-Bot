@@ -35,11 +35,12 @@ void loop() {
     if (parsed == 5) {
       RfCommand out;
       out.seq   = cmdSeq++;
-      // המנועים מחוברים פיזית הפוך בסירה: ערוץ "ימין" הלוגי הניע את המנוע
-      // השמאלי (אומת בבדיקת סריאל ישירה). מתקנים כאן, בממסר החוף, כך שהתיקון
-      // חל גם על השרת וגם על בדיקות ישירות — בלי צורך לצרוב מחדש את הסירה.
-      out.left  = rf_speed_encode(rightSpeed);
-      out.right = rf_speed_encode(leftSpeed);
+      // מיפוי ישר: ערוץ שמאל לוגי -> מנוע שמאל, ימין -> ימין. ההחלפה הקודמת
+      // הצליבה את הערוצים (וגם את הגבלות המהירות שהשרת מחיל לכל ערוץ בנפרד),
+      // כך שמחוון "מנוע ימין" הגביל בפועל את המנוע השמאלי. עכשיו שני הקצוות
+      // ישרים ועקביים עם control_server.py.
+      out.left  = rf_speed_encode(leftSpeed);
+      out.right = rf_speed_encode(rightSpeed);
       out.winch = rf_speed_encode(winchSpeed);
       out.flags = (mode ? 0x01 : 0x00);
       // radarAngle לא נשלח: הסירה סורקת מקומית ומתעלמת ממנו ממילא.

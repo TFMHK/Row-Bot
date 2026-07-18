@@ -95,13 +95,12 @@ uint8_t lastCmdSeq = 0;
 bool haveCmdSeq = false;
 uint8_t telSeq = 0;
 
-// Failsafe: אם לא מתקבלת פקודה תקינה תוך פרק הזמן הזה (למשל אובדן קשר RF),
-// המנועים נעצרים אוטומטית כדי שהסירה לא תמשיך לנוע "בעיוורון" עד לריסט.
-// הועלה מ-800 ל-1500ms כדי "לרכוב מעל" דעיכות RF קצרות (טווח) בלי לעצור מנועים.
+// Failsafe: פרק הזמן שבו היעדר פקודה תקינה נחשב "אבד קשר". במצב ידני זה מפעיל
+// עצירה והמתנה; במצב אוטומטי הניווט המובנה ממשיך (רק החיווי משתנה).
+// 1500ms — "רוכב מעל" דעיכות RF קצרות (טווח) בלי להיחשב מיד כניתוק.
 const unsigned long FAILSAFE_TIMEOUT_MS = 1500;
 unsigned long lastCommandMs = 0;
-bool motorsStopped = true;
-// כשאבד קשר (failsafe) הטבעת מוצגת אדומה קבוע כחיווי בטיחות.
+// חיווי אובדן קשר על הטבעת (אדום=ידני-ממתין, סגול=אוטונומי-ממשיך). מונע ציור חוזר.
 bool linkLost = false;
 // המצב האחרון שהוצג על הטבעת (0=ידני,1=אוטומטי). -1 = טרם הוצג,
 // מאלץ ציור ראשון. show() מתבצע רק כשהערך הזה משתנה — אירוע נדיר.
@@ -130,12 +129,78 @@ const unsigned long UPLINK_SILENCE_MS = 550;
 // ה-heartbeat (400ms) של החוף, נכנסת ל-"פינג-פונג" והגיבוי מפסיק מעצמו.
 const unsigned long TELEMETRY_FALLBACK_MS = 500;
 
+// ===== ניווט אוטונומי מובנה (על-הסיפון) =====
+// כל לוגיקת ההימנעות רצה כאן, על הארדואינו של הסירה, בקצב החיישנים המקומי המלא
+// (מהיר בהרבה מקישור ה-RF האיטי/לא-יציב). קישור הרדיו משמש רק ל: תמונת שו"ב
+// ב-UI, מעבר בין מצב אוטונומי לידני, ופקודות ידניות.
+//   • הסירה לעולם אינה יוזמת מצב אוטומטי בעצמה — רק פקודת mode=1 מהחוף מפעילה אותו.
+//   • אם התקשורת מתנתקת במצב אוטומטי — הסירה ממשיכה בניווט האוטונומי המובנה.
+//   • אם התקשורת מתנתקת במצב ידני — הסירה עוצרת וממתינה עד שהקשר יתחדש.
+// ⚠️ החיישן האחורי (usRadar) שבור => אין חישה לאחור => הניווט מעדיף סיבוב-במקום
+//    על נסיעה לאחור. יוצא-דופן: כשההתנגשות החזיתית קרובה ומסוכנת (מתחת ל-
+//    EMERGENCY) עדיף פרץ-נסיעה קצר לאחור — סיכון אחורי לא-ודאי (חיישן שבור) עדיף
+//    על התנגשות חזיתית ודאית. מאחר שנמנעים מנסיעה אחורה ברוב הזמן, טווח ההימנעות
+//    הקדמי הוגדל (BLOCK) כדי להגיב מוקדם יותר.
+
+// זווית הסרוו שבה החיישן הקדמי מצביע אל חרטום הסירה (מכיול ~60°). דורש כיול ביבשה.
+const float NAV_BOW_OFFSET_DEG = 60.0f;
+// כיוון הסריקה מול כיוון הסיבוב הפיזי (+1/-1). להפוך אם ימין/שמאל מתחלפים בכיול.
+const int   NAV_SWEEP_SIGN = 1;
+// חצי-רוחב מגזר החרטום (מעלות): קריאה בטווח ±זה נחשבת "לפנים".
+const float NAV_FRONT_HALF_DEG = 45.0f;
+// מרחק שמתחתיו החרטום חסום => עצור קדימה, פנה במקום. הוגדל (טווח הימנעות מוקדם
+// יותר, כי נמנעים מנסיעה אחורה), אך נשאר מתחת לרצפת החזר-המים של usFront (~56ס"מ)
+// כדי שמים פתוחים לא ייחשבו בטעות לחסומים.
+const int   NAV_FRONT_BLOCK_CM = 50;
+// מרחק שמעליו החרטום נחשב פנוי שוב (היסטרזיס — מונע ריצוד בין נסיעה לסיבוב).
+const int   NAV_FRONT_CLEAR_CM = 75;
+// "סכנת התנגשות חזיתית": קרוב מדי מכדי להסתפק בסיבוב-במקום => פרץ נסיעה לאחור.
+const int   NAV_FRONT_EMERGENCY_CM = 30;
+// ניווט "עקוב-אחר-הפער" (follow-the-gap): במקום לנסוע ישר עד שנתקעים, הסירה
+// סורקת קשת קדמית ומכוונת אל הכיוון ה*פתוח ביותר*, ונוסעת רק כשהחרטום מיושר איתו.
+// כך היא פונה יזום אל מרחב פתוח (למשל ימינה בהתחלה) ולעולם לא נוסעת לתוך מכשול.
+const float NAV_SCAN_HALF_DEG = 90.0f;    // סורקים ±90° מהחרטום לחיפוש הפער העמוק ביותר
+const float NAV_ALIGN_DEG = 20.0f;        // חרטום בטווח ±זה מהפער => נוסעים; אחרת מסתובבים אליו
+const float NAV_GAP_WINDOW_DEG = 22.0f;   // חצי-חלון החרוט סביב כל כיוון-מועמד (פער רחב, לא תא בודד)
+// משך פרץ הנסיעה-לאחור בחירום (מחויב — מונע ריצוד קדימה/אחורה על רעש חיישן).
+const unsigned long NAV_REVERSE_BURST_MS = 600;
+// עוצמות המנוע לניווט האוטונומי נקבעות ע"י שרת החוף ומגיעות בשדות המהירות של
+// הפקודה: כשהחוף מעביר למצב אוטומטי הוא שולח את עוצמות המנוע המכוילות (למשל
+// שמאל 84 / ימין 88 — המנוע השמאלי חלש יותר). הניווט המובנה משתמש ב|ערך המוחלט|
+// של cmd.leftSpeed/cmd.rightSpeed כעוצמה לכל צד ומחליט בעצמו רק על הכיוון
+// (קדימה/סיבוב/אחורה). כך הכיול נשאר כולו בחוף — אין צורך לצרוב מחדש כדי לכוונן.
+// תוקף קריאת-מגזר: קריאה ישנה מזה נחשבת "לא ידוע".
+const unsigned long NAV_SECTOR_TTL_MS = 2000;
+
+// מצב הניווט המובנה
+bool navTurning = false;          // האם כרגע מבצעים סיבוב-הימנעות (עם היסטרזיס)
+int  navTurnDir = 1;              // +1 = חרטום ימינה, -1 = חרטום שמאלה
+unsigned long navReverseUntil = 0; // סוף פרץ-הנסיעה-לאחור בחירום (0 = לא פעיל)
+
+// מפת-מרחק לפי כיוון (bearing) ביחס לחרטום — 24 תאים ברזולוציית 15° (תואם צעד
+// הסריקה ומרווח 90° בין 4 החיישנים). כל תא שומר את המרחק האחרון שנמדד בכיוון
+// ההוא + חותם-זמן. זהו המבנה הנכון (כמו liveScan ב-UI): קיר דק שנתפס בזווית-סרוו
+// אחת נשאר בתא שלו לאורך ה-TTL, ואינו נמחק ע"י קריאת "פתוח" מזווית סמוכה — כך
+// הסירה לא נוסעת דרך מכשול דק שהחיישן פספס ברוב זוויות הסריקה. מרחק המגזר =
+// המינימום (הקרוב ביותר) על-פני התאים הטריים בחרוט (coneMin).
+const int NAV_BINS = 24;               // 360°/15°
+const int NAV_BIN_DEG = 15;
+int  navBinDist[NAV_BINS];             // מרחק אחרון לכל תא (ס"מ; 999 = פתוח)
+unsigned long navBinT[NAV_BINS];       // חותם-זמן אחרון לכל תא (0 = לא נמדד)
+
 void controlMotor(int in1, int in2, int pwmPin, int speed);
 void readAllUltrasonic(int results[4]);
 void showPixel(uint8_t r, uint8_t g, uint8_t b);
 void showModeColor(int mode);
 void slewRadarServoTo(int target);
 void sendTelemetry();
+void applyDrive(int left, int right);
+void navReset();
+void navIngest(int idx, int dist, int servoAngle);
+int  navConeMin(float centerDeg, float halfDeg, unsigned long now, bool *anyFresh);
+void navDeepest(float loDeg, float hiDeg, unsigned long now, float *bestBearing, int *bestClear);
+void computeAutonomousDrive(unsigned long now, int *leftOut, int *rightOut);
+float navNormalizeDeg(float d);
 
 void setup() {
   pinMode(MOTOR1_IN1, OUTPUT);
@@ -173,11 +238,11 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // 1) קליטת פקודות (לא חוסמת): שולטת רק במנועים וברשת. זווית המכם כבר לא מגיעה
-  //    מהפקודה — הסריקה מקומית לגמרי. מיד עם קבלת פקודה משדרים טלמטריה ("פינג-
-  //    פונג"): החוף בדיוק סיים לשדר ולכן נמצא במצב האזנה, כך שהשידור נוחת אמין.
-  //    כל פריים חייב לעבור אימות MAC (מפתח סודי) + בדיקת seq — פריים מגורם זר
-  //    או פריים ישן ש"מנוגן מחדש" נדחה בשקט ולא משפיע על המנועים.
+  // 1) קליטת פקודות (לא חוסמת): מעדכנת מצב (ידני/אוטומטי), מהירויות ידניות וכננת.
+  //    מיד עם קבלת פקודה משדרים טלמטריה ("פינג-פונג") כדי שהיא תנחת אמין בזמן
+  //    שהחוף מאזין. כל פריים חייב לעבור אימות MAC + בדיקת seq — פריים זר/ישן נדחה.
+  //    הערה: המנועים אינם מופעלים כאן אלא בשלב 3 (שיפוט אחיד לפי מצב+קשר), כדי
+  //    שבמצב אוטומטי הניווט המובנה ישלוט ולא ערוצי המהירות הידניים שבפקודה.
   uint8_t buf[RH_ASK_MAX_MESSAGE_LEN];
   uint8_t buflen = sizeof(buf);
   if (driver.recv(buf, &buflen) && buflen == sizeof(RfCommand)) {
@@ -189,24 +254,22 @@ void loop() {
       cmd.leftSpeed  = rf_speed_decode(in.left);
       cmd.rightSpeed = rf_speed_decode(in.right);
       cmd.winchSpeed = rf_speed_decode(in.winch);
-      cmd.mode       = (in.flags & 0x01) ? 1 : 0;
+      int newMode    = (in.flags & 0x01) ? 1 : 0;
+      // מעבר לאוטומטי => אתחל את מצב הניווט כדי שלא יסתמך על נעילת-סיבוב ישנה.
+      if (newMode == 1 && cmd.mode != 1) navReset();
+      cmd.mode = newMode;
       lastCommandMs = now;
-      motorsStopped = false;
       linkLost = false;
 
       sendTelemetry();
       lastTelemetrySentMs = now;
 
-      controlMotor(MOTOR1_IN1, MOTOR1_IN2, MOTOR1_PWM, cmd.leftSpeed);
-      controlMotor(MOTOR2_IN1, MOTOR2_IN2, MOTOR2_PWM, cmd.rightSpeed);
-
-      // סרוו הרשת: ממפה מהירות -255..255 לזווית 0..180
+      // סרוו הרשת: ממפה מהירות -255..255 לזווית 0..180 (מופעל בכל מצב).
       int netAngle = map(constrain(cmd.winchSpeed, -255, 255), -255, 255, 0, 180);
       netServo.write(netAngle);
 
-      // חיווי מצב על הטבעת: צבע לפי המצב (ידני/אוטומטי) שנשלח מהחוף.
-      // קוראים ל-pixel.show() (שמכבה פסיקות ~240µs) רק כשהמצב משתנה בפועל
-      // — אירוע נדיר — כך שהוא לעולם לא נופל בזמן קליטת פקודות ולא תוקע את המנועים.
+      // חיווי מצב על הטבעת רק כשהמצב משתנה בפועל — אירוע נדיר — ורק כאן, מיד
+      // אחרי קליטה+שידור (החלון הבטוח: החוף מאזין, ואין קליטת RF שתישבש מ-show()).
       if (cmd.mode != lastMode) {
         lastMode = cmd.mode;
         showModeColor(cmd.mode);
@@ -215,12 +278,11 @@ void loop() {
   }
 
   // 2) סריקת מכם אוטונומית מקומית — רצה תמיד לפי טיימר, גם ללא פקודות כלל.
-  //    מקדמת את זווית הסריקה, מזיזה את הסרוו בתנועה רציפה, דוגמת את החיישנים
-  //    ושומרת לתוך telemetry את הזווית והמרחקים שנקלטו.
+  //    מקדמת את זווית הסריקה, מזיזה את הסרוו, דוגמת את החיישנים, שומרת ל-telemetry
+  //    ובנוסף מזינה את תפיסת הניווט המובנה (navIngest) בכל קריאה תקינה.
   if (now - lastRadarSweepMs >= RADAR_SWEEP_INTERVAL_MS) {
     lastRadarSweepMs = now;
 
-    // קדם את זווית הסריקה בהלוך-חזור בין הגבולות
     int nextAngle = radarServoTarget + RADAR_SWEEP_STEP * radarSweepDir;
     if (nextAngle >= RADAR_SWEEP_MAX) {
       nextAngle = RADAR_SWEEP_MAX;
@@ -230,10 +292,8 @@ void loop() {
       radarSweepDir = 1;
     }
 
-    // הזז את הסרוו בתנועה רציפה (החלקה) — משמש גם כזמן ההתייצבות לפני הדגימה
     slewRadarServoTo(nextAngle);
 
-    // קרא את החיישנים בזווית הנוכחית ואחסן לשידור
     int usResults[4];
     readAllUltrasonic(usResults);
     telemetry.usRadar = usResults[0];
@@ -242,35 +302,50 @@ void loop() {
     telemetry.usRight = usResults[3];
     telemetry.radarAngle = nextAngle;
 
-    // הערה: אין כאן רענון של הטבעת. pixel.show() מכבה פסיקות ~240µs (8 לדים)
-    // ואם ירוץ בתזמון אקראי (כל ~90ms) הוא משבש את דגימת ה-RF (טיימר) ומשמיד
-    // פאקטות נכנסות → failsafe עוצר מנועים. לכן מעדכנים את הטבעת רק בחלון הבטוח:
-    // מיד אחרי קבלת פקודה ושידור טלמטריה (בבלוק 1), כשהחוף מאזין ולא משדר אלינו.
+    // הזנת תפיסת הניווט המובנה: כל חיישן (למעט האחורי השבור, idx 0) ממופה
+    // לזווית ביחס לחרטום לפי זווית הסרוו ומוכנס למגזר קדמי/ימני/שמאלי.
+    for (int i = 0; i < 4; i++) navIngest(i, usResults[i], nextAngle);
   }
 
-  // 3) שידור-גיבוי עצמאי: כשקו הפקודות (חוף→סירה) שותק אין "פינג-פונג", ולכן
-  //    הסירה משדרת את הזווית+המרחקים בכוחות עצמה. כך המכם ממשיך לשדר מה שהוא
-  //    קולט גם ללא תקשורת נכנסת — בלי תלות כפולה בקו התקשורת.
+  // 3) שיפוט הנעה לפי מצב + מצב-קשר:
+  //    linkActive = התקבלה פקודה תקינה בטווח ה-failsafe האחרון.
+  bool linkActive = (now - lastCommandMs <= FAILSAFE_TIMEOUT_MS);
+  int driveL = 0, driveR = 0;
+
+  if (cmd.mode == 1) {
+    // אוטומטי: הניווט המובנה שולט תמיד — עם קשר או בלעדיו. אובדן קשר אינו עוצר.
+    computeAutonomousDrive(now, &driveL, &driveR);
+  } else {
+    // ידני: המנועים מבצעים את הפקודה שהתקבלה. באובדן קשר — עצירה והמתנה.
+    if (linkActive) {
+      driveL = cmd.leftSpeed;
+      driveR = cmd.rightSpeed;
+    } else {
+      driveL = 0;
+      driveR = 0;
+      netServo.write(NET_SERVO_NEUTRAL);  // ניטרול הכננת בזמן המתנה
+    }
+  }
+  applyDrive(driveL, driveR);
+
+  // 4) שידור-גיבוי עצמאי של טלמטריה כשקו הפקודות שותק (uplink שקט), כדי שהמכם
+  //    ימשיך לשדר תמונת שו"ב גם ללא תקשורת נכנסת.
   if (now - lastCommandMs > UPLINK_SILENCE_MS &&
       now - lastTelemetrySentMs >= TELEMETRY_FALLBACK_MS) {
     sendTelemetry();
     lastTelemetrySentMs = now;
   }
 
-  // 4) Failsafe watchdog: אם עברו יותר מ-FAILSAFE_TIMEOUT_MS בלי פקודה תקינה,
-  //    עצור את המנועים פעם אחת (millis() בחשבון unsigned עמיד ל-overflow).
-  //    שים לב: המכם ממשיך לסרוק ולשדר — רק המנועים נעצרים.
-  if (!motorsStopped && (now - lastCommandMs > FAILSAFE_TIMEOUT_MS)) {
-    controlMotor(MOTOR1_IN1, MOTOR1_IN2, MOTOR1_PWM, 0);
-    controlMotor(MOTOR2_IN1, MOTOR2_IN2, MOTOR2_PWM, 0);
-    netServo.write(NET_SERVO_NEUTRAL);
+  // 5) חיווי אובדן/חידוש קשר על הטבעת. show() נקרא רק פעם אחת במעבר-למנותק
+  //    (אין אז קליטת RF שתישבש), ובחידוש הקשר lastMode=-1 מאלץ ציור-מחדש בשלב 1.
+  if (!linkActive && !linkLost) {
     linkLost = true;
-    showPixel(60, 0, 0); // אדום = אבד קשר (failsafe)
-    lastMode = -1;       // בהתאוששות הקשר — לצייר מחדש את צבע המצב
-    cmd.leftSpeed = 0;
-    cmd.rightSpeed = 0;
-    cmd.winchSpeed = 0;
-    motorsStopped = true;
+    lastMode = -1;  // בחידוש הקשר — לצייר מחדש את צבע המצב
+    if (cmd.mode == 1) {
+      showPixel(60, 0, 60);  // סגול = אוטונומי ללא קשר (ממשיך לנווט בעצמו)
+    } else {
+      showPixel(60, 0, 0);   // אדום = ידני ללא קשר (עצר וממתין לחידוש)
+    }
   }
 }
 
@@ -390,4 +465,147 @@ void sendTelemetry() {
   rf_tel_sign(&out);
   driver.send((uint8_t*)&out, sizeof(RfTelemetry));
   driver.waitPacketSent();
+}
+
+// ===== ניווט אוטונומי מובנה =====
+
+// מפעיל את שני המנועים בפקודה נתונה (PWM חתום -255..255 לכל צד).
+void applyDrive(int left, int right) {
+  controlMotor(MOTOR1_IN1, MOTOR1_IN2, MOTOR1_PWM, left);
+  controlMotor(MOTOR2_IN1, MOTOR2_IN2, MOTOR2_PWM, right);
+}
+
+// מנרמל זווית לטווח (-180, 180].
+float navNormalizeDeg(float d) {
+  while (d > 180.0f) d -= 360.0f;
+  while (d <= -180.0f) d += 360.0f;
+  return d;
+}
+
+// המרחק הקרוב ביותר (מינימום) על-פני התאים הטריים בחרוט [center±half].
+// anyFresh מוחזר true אם נמצא לפחות תא טרי אחד בחרוט (אחרת אין נתון => "לא ידוע").
+int navConeMin(float centerDeg, float halfDeg, unsigned long now, bool *anyFresh) {
+  int best = 999;
+  bool found = false;
+  for (int i = 0; i < NAV_BINS; i++) {
+    if (navBinT[i] == 0) continue;
+    if (now - navBinT[i] > NAV_SECTOR_TTL_MS) continue;  // תא ישן — מתעלמים
+    float binBearing = navNormalizeDeg((float)(i * NAV_BIN_DEG));
+    if (fabs(navNormalizeDeg(binBearing - centerDeg)) > halfDeg) continue;
+    found = true;
+    if (navBinDist[i] < best) best = navBinDist[i];
+  }
+  if (anyFresh) *anyFresh = found;
+  return best;
+}
+
+// מאתחל את מצב הניווט המובנה (בעת מעבר לאוטומטי): מבטל נעילת-סיבוב ומאפס את
+// מפת התאים כך שהניווט לא ינהג לפי נתונים ישנים עד שתגיע סריקה טרייה.
+void navReset() {
+  navTurning = false;
+  navReverseUntil = 0;
+  for (int i = 0; i < NAV_BINS; i++) { navBinDist[i] = 999; navBinT[i] = 0; }
+}
+
+// מזין קריאת חיישן בודדת למפת התאים: ממפה לפי זווית הסרוו והבסיס הזוויתי של
+// החיישן לזווית ביחס לחרטום, ושומר את המרחק בתא המתאים (המגזר האחורי idx=0 נזרק —
+// החיישן שבור). "אין הד" (999) הוא מדידה טרייה של "פתוח בטווח מרבי" — נשמר גם הוא
+// (לא מדולג) כדי שמים פתוחים = נסיעה קדימה. קיר דק שנתפס בזווית אחת נשאר בתא שלו
+// לאורך ה-TTL ואינו נמחק ע"י "פתוח" מזווית סמוכה (תא נפרד) — כך לא נוסעים דרכו.
+void navIngest(int idx, int dist, int servoAngle) {
+  if (idx == 0) return;  // חיישן אחורי שבור — מתעלמים לחלוטין
+  int m = dist;
+  if (m <= 0 || m > 999) m = 999;
+
+  // בסיס זוויתי של כל חיישן ביחס לחיישן הקדמי (idx1=front,2=left,3=right):
+  float base = (idx == 1) ? 0.0f : (idx == 2) ? -90.0f : 90.0f;
+  float bearing = navNormalizeDeg(NAV_SWEEP_SIGN * (float)servoAngle - NAV_BOW_OFFSET_DEG + base);
+  int bin = ((int)lroundf(bearing / (float)NAV_BIN_DEG) + NAV_BINS) % NAV_BINS;
+  navBinDist[bin] = m;
+  navBinT[bin] = millis();
+}
+
+// מוצא את הכיוון ה"פתוח ביותר" בקשת [lo,hi]: לכל כיוון-מועמד (בצעדי 15°) מחשב
+// את המרחק הפנוי בחרוט סביבו (navConeMin עם חלון), ובוחר את בעל המרחק הגדול ביותר.
+// שובר-שוויון: כיוון קרוב יותר לחרטום (|bearing| קטן) — מונע נטייה שרירותית הצידה
+// במרחב פתוח אחיד. מחזיר bestClear=-1 אם אין אף תא טרי בקשת.
+void navDeepest(float loDeg, float hiDeg, unsigned long now, float *bestBearing, int *bestClear) {
+  int best = -1;
+  float bestB = 0.0f;
+  for (float b = loDeg; b <= hiDeg + 0.5f; b += (float)NAV_BIN_DEG) {
+    bool fresh = false;
+    int c = navConeMin(b, NAV_GAP_WINDOW_DEG, now, &fresh);
+    if (!fresh) continue;
+    if (c > best || (c == best && fabs(b) < fabs(bestB))) { best = c; bestB = b; }
+  }
+  *bestBearing = bestB;
+  *bestClear = best;
+}
+
+// מחשב את פקודת ההנעה האוטונומית — ניווט "עקוב-אחר-הפער":
+//   • מכוונים אל הכיוון הפתוח ביותר בקשת הקדמית; אם החרטום כבר מיושר איתו והחזית
+//     פנויה => נסיעה קדימה; אחרת => סיבוב-במקום לעברו (הימנעות יזומה, לא נוסעים
+//     לתוך מכשול). כך הסירה פונה אל מרחב פתוח (ולא ישר עד שנתקעת).
+//   • כל הכיוונים חסומים ("קופסה") + החזית קרובה => פרץ נסיעה לאחור (מוצא אחרון,
+//     כי המכם האחורי שבור). אין נתון קדמי טרי => עצירה עד שהסריקה תרענן.
+// עוצמת המנוע לכל צד = |המהירות שהחוף שלח|; הניווט קובע רק את הכיוון.
+void computeAutonomousDrive(unsigned long now, int *leftOut, int *rightOut) {
+  int magL = abs(cmd.leftSpeed);  if (magL > 255) magL = 255;
+  int magR = abs(cmd.rightSpeed); if (magR > 255) magR = 255;
+
+  // 0) פרץ נסיעה-לאחור מחויב (מוצא-חירום מ"קופסה"): המשך עד תום הפרץ.
+  if ((long)(navReverseUntil - now) > 0) {
+    *leftOut = -magL; *rightOut = -magR;
+    return;
+  }
+
+  // מרחק פנוי בחזית (לבדיקת בטיחות-נסיעה) + הכיוון הפתוח ביותר בקשת ובמעגל המלא.
+  bool frontFresh = false;
+  int front = navConeMin(0.0f, NAV_FRONT_HALF_DEG, now, &frontFresh);
+  if (!frontFresh) { *leftOut = 0; *rightOut = 0; return; }  // אין נתון קדמי טרי => עצור
+
+  float fwdB; int fwdClear;
+  navDeepest(-NAV_SCAN_HALF_DEG, NAV_SCAN_HALF_DEG, now, &fwdB, &fwdClear);  // הפער הטוב בקשת הקדמית
+  float allB; int allClear;
+  navDeepest(-180.0f, 180.0f, now, &allB, &allClear);                        // הפער הטוב בכל כיוון
+
+  // 1) התחייבות-לסיבוב (היסטרזיס): אם מסתובבים, המשך עד שהפער מיושר עם החרטום
+  //    והחזית פנויה — כדי לא לבטל סיבוב באמצע בגלל ריצוד.
+  if (navTurning) {
+    if (fabs(fwdB) <= NAV_ALIGN_DEG && front >= NAV_FRONT_BLOCK_CM) {
+      navTurning = false;
+    } else {
+      if (navTurnDir > 0) { *leftOut = magL;  *rightOut = -magR; }
+      else                { *leftOut = -magL; *rightOut = magR;  }
+      return;
+    }
+  }
+
+  // 2) הפער מיושר עם החרטום והחזית פנויה => נסיעה קדימה.
+  if (front >= NAV_FRONT_BLOCK_CM && fabs(fwdB) <= NAV_ALIGN_DEG) {
+    *leftOut = magL; *rightOut = magR;
+    return;
+  }
+
+  // 3) צריך לפנות: בוחרים יעד-פנייה = הפער הקדמי אם הוא פתוח מספיק, אחרת הפער
+  //    הטוב ביותר בכל כיוון (גם מאחור — מסתובבים לעברו בלי לנסוע אחורה).
+  float target;
+  if (fwdClear >= NAV_FRONT_BLOCK_CM) {
+    target = fwdB;
+  } else if (allClear >= NAV_FRONT_BLOCK_CM) {
+    target = allB;
+  } else {
+    // "קופסה": שום כיוון אינו פתוח. אם החזית קרובה מסוכן => פרץ נסיעה לאחור.
+    if (front < NAV_FRONT_EMERGENCY_CM) {
+      navReverseUntil = now + NAV_REVERSE_BURST_MS;
+      *leftOut = -magL; *rightOut = -magR;
+      return;
+    }
+    target = allB;  // מסתובבים לעבר הפחות-חסום עד שייפתח משהו
+  }
+
+  navTurnDir = (target >= 0.0f) ? 1 : -1;   // סיבוב לעבר הפער (target>0 => חרטום ימינה)
+  navTurning = true;
+  if (navTurnDir > 0) { *leftOut = magL;  *rightOut = -magR; }
+  else                { *leftOut = -magL; *rightOut = magR;  }
 }
