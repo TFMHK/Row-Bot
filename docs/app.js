@@ -39,6 +39,14 @@ const mapPointsValue = document.getElementById("mapPointsValue");
 const mapClearBtn = document.getElementById("mapClearBtn");
 const motorLeftAbsInput = document.getElementById("motorLeftAbs");
 const motorRightAbsInput = document.getElementById("motorRightAbs");
+const navFrontBlockInput = document.getElementById("navFrontBlock");
+const navFrontClearInput = document.getElementById("navFrontClear");
+const navFrontEmergencyInput = document.getElementById("navFrontEmergency");
+const navDecisionInput = document.getElementById("navDecision");
+const navDecisionHalfInput = document.getElementById("navDecisionHalf");
+const navSideStandoffInput = document.getElementById("navSideStandoff");
+const navBowOffsetInput = document.getElementById("navBowOffset");
+const navSweepSignInput = document.getElementById("navSweepSign");
 // The mock world picture and the accumulated radar map are meaningful ONLY in
 // mock mode (both rely on the simulator's dead-reckoned world pose). On a real
 // boat they show stale/garbage, so the whole panels are hidden off-mock.
@@ -65,6 +73,9 @@ const state = {
   // אפקטיבית שווה). אומדן הפוזה משתמש בהן כדי לשקף את המהירות/התמרון האמיתיים.
   motorLeftAbs: 84,
   motorRightAbs: 88,
+  // פרמטרי כיוונון הניווט האוטונומי, נשלטים מהחוף (UI) ונדחפים מהשרת. משמשים את
+  // תאום-המוק בזמן-אמת (ובעתיד יישלחו לסירה ב-RF). ברירת-מחדל = קבועי הקושחה.
+  navConfig: { frontBlock: 55, frontClear: 90, frontEmergency: 45, decision: 100, decisionHalf: 60, sideStandoff: 40, bowOffset: 60, sweepSign: 1 },
   // אודומטריה צד-לקוח (dead-reckoning): אומדן פוזה מתוך אינטגרציה של אותן
   // פקודות המנועים שאנו שולחים, באותו מודל קינמטי כמו הסירה/הסימולטור. זה מה
   // שחומרה אמיתית תעשה (אין GPS/מצפן על החוט), ולכן כל מחסנית התפיסה+הניווט רצה
@@ -451,6 +462,14 @@ mockSwitch.addEventListener("change", onMockToggle);
 mapClearBtn.addEventListener("click", clearRadarMap);
 motorLeftAbsInput.addEventListener("change", () => sendMotorConfig("motorLeftAbs", motorLeftAbsInput));
 motorRightAbsInput.addEventListener("change", () => sendMotorConfig("motorRightAbs", motorRightAbsInput));
+navFrontBlockInput.addEventListener("change", () => sendNavConfig("frontBlock", navFrontBlockInput, 10, 300));
+navFrontClearInput.addEventListener("change", () => sendNavConfig("frontClear", navFrontClearInput, 10, 320));
+navFrontEmergencyInput.addEventListener("change", () => sendNavConfig("frontEmergency", navFrontEmergencyInput, 5, 200));
+navDecisionInput.addEventListener("change", () => sendNavConfig("decision", navDecisionInput, 20, 400));
+navDecisionHalfInput.addEventListener("change", () => sendNavConfig("decisionHalf", navDecisionHalfInput, 10, 90));
+navSideStandoffInput.addEventListener("change", () => sendNavConfig("sideStandoff", navSideStandoffInput, 5, 200));
+navBowOffsetInput.addEventListener("change", () => sendNavConfig("bowOffset", navBowOffsetInput, 0, 180));
+navSweepSignInput.addEventListener("change", () => sendNavConfig("sweepSign", navSweepSignInput, -1, 1));
 if (downloadNavBtn) {
   downloadNavBtn.addEventListener("click", () => {
     if (window.LocalBridge) LocalBridge.downloadNavLog();
@@ -606,6 +625,44 @@ function updateMotorConfigUI(remoteState) {
   }
   if (document.activeElement !== motorRightAbsInput && remoteState.motorRightAbs != null) {
     motorRightAbsInput.value = String(remoteState.motorRightAbs);
+  }
+}
+
+// Shore-controlled onboard-nav tuning param: POST it, the server clamps + echoes
+// it back, applied live to the mock twin (and to the boat over RF once flashed).
+async function sendNavConfig(key, input, lo, hi) {
+  let value = Math.round(Number(input.value));
+  if (!Number.isFinite(value)) return;
+  value = Math.max(lo, Math.min(hi, value));
+  input.value = String(value);
+  try {
+    const response = await postJson("/api/navconfig", { [key]: value });
+    applyRemoteState(response.state);
+  } catch (err) {
+    setServerMessage(`עדכון פרמטר ניווט נכשל: ${err.message}`, true);
+  }
+}
+
+// Reflect the server's nav-config in the text boxes (never overwrite a focused one).
+function updateNavConfigUI(remoteState) {
+  if (!remoteState.navConfig) return;
+  state.navConfig = remoteState.navConfig;
+  // קיזוז החרטום נשלט מה-UI: מזינים אותו לתאום-המוק כדי שהתפיסה + הדמיית
+  // החיישנים ישתמשו באותו ערך (וגם נשלח לסירה האמיתית ב-RF דרך השרת).
+  if (remoteState.navConfig.bowOffset != null) {
+    state.nav.bowOffsetDeg = remoteState.navConfig.bowOffset;
+  }
+  const map = {
+    frontBlock: navFrontBlockInput, frontClear: navFrontClearInput,
+    frontEmergency: navFrontEmergencyInput, decision: navDecisionInput,
+    decisionHalf: navDecisionHalfInput, sideStandoff: navSideStandoffInput,
+    bowOffset: navBowOffsetInput, sweepSign: navSweepSignInput,
+  };
+  for (const key in map) {
+    const input = map[key];
+    if (input && document.activeElement !== input && remoteState.navConfig[key] != null) {
+      input.value = String(remoteState.navConfig[key]);
+    }
   }
 }
 
@@ -1189,6 +1246,7 @@ function applyRemoteState(remoteState, syncCmd = false) {
   updateCommandUI();
   setConnectedUI(state.connected, state.serialPort);
   updateMotorConfigUI(remoteState);
+  updateNavConfigUI(remoteState);
 
   mockSwitch.checked = state.mockEnabled;
   portSelect.disabled = state.mockEnabled || state.connected;
@@ -2576,15 +2634,28 @@ function startProtoPulse(dir, now) {
 // במים". צורך את אותם שדות טלמטריה שהסירה קוראת מקומית (usFront/usLeft/usRight +
 // radarAngle; usRadar האחורי מושמט — שבור), דרך תפיסת ה-liveScan/liveCone
 // (bow-relative, אותו bowOffset=60 כמו הקושחה). קבועים זהים לקושחה:
-const NAV_TWIN_FRONT_HALF_DEG = 45;    // חצי-רוחב מגזר החרטום (NAV_FRONT_HALF_DEG)
-const NAV_TWIN_BLOCK_CM = 50;          // NAV_FRONT_BLOCK_CM
-const NAV_TWIN_CLEAR_CM = 75;          // NAV_FRONT_CLEAR_CM
-const NAV_TWIN_EMERGENCY_CM = 30;      // NAV_FRONT_EMERGENCY_CM
+const NAV_TWIN_FRONT_HALF_DEG = 20;    // חצי-רוחב מגזר החרטום (NAV_FRONT_HALF_DEG; צר => רק מכשול ישר לפנים חוסם)
+const NAV_TWIN_BLOCK_CM = 55;          // NAV_FRONT_BLOCK_CM
+const NAV_TWIN_CLEAR_CM = 90;          // NAV_FRONT_CLEAR_CM
+const NAV_TWIN_EMERGENCY_CM = 45;      // NAV_FRONT_EMERGENCY_CM
 const NAV_TWIN_SCAN_HALF_DEG = 90;     // NAV_SCAN_HALF_DEG (סורקים ±90° לחיפוש הפער העמוק)
 const NAV_TWIN_ALIGN_DEG = 20;         // NAV_ALIGN_DEG (חרטום מיושר עם הפער => נוסעים)
 const NAV_TWIN_GAP_WINDOW_DEG = 22;    // NAV_GAP_WINDOW_DEG (חצי-חלון החרוט סביב כל מועמד)
+const NAV_TWIN_FRONT_DECISION_CM = 100; // NAV_FRONT_DECISION_CM (מתחילים להחליט מוקדם)
+const NAV_TWIN_DECISION_HALF_DEG = 60;  // NAV_DECISION_HALF_DEG (קשת ההחלטה =120°)
 const NAV_TWIN_REVERSE_BURST_MS = 600; // NAV_REVERSE_BURST_MS
-const NAV_TWIN_SECTOR_TTL_MS = 2000;   // NAV_SECTOR_TTL_MS
+const NAV_TWIN_SECTOR_TTL_MS = 4000;   // NAV_SECTOR_TTL_MS (מגשר על סריקה איטית — מונע עצירות-המתנה)
+// איזון קירות-צד בשיוט (NAV_SIDE_*): מרחק שיוט אידיאלי מהצד + חצי-חרוט הצד.
+const NAV_TWIN_SIDE_TARGET_CM = 40;    // NAV_SIDE_TARGET_CM
+const NAV_TWIN_SIDE_HALF_DEG = 45;     // NAV_SIDE_HALF_DEG
+// מירכוז חל רק בתוך מסדרון (שני הצדדים קרובים מזה) — קיר יחיד => נסיעה ישרה.
+const NAV_TWIN_SIDE_CORRIDOR_CM = 70;  // NAV_SIDE_CORRIDOR_CM
+// סף אסימטריה: רק כשההפרש בין הצדדים מובהק מטים — מונע ריצוד סביב קו-האמצע.
+// (ייחודי לתאום: מודל המנוע במוק 3-מצבי, מקרב את הקשת הפרופורציונלית של הקושחה.)
+const NAV_TWIN_SIDE_BAND_CM = 8;
+// מרווח-מעבר מקיר צד (היסטרזיס): צד קרוב מ-ENGAGE => קשת התרחקות, עד RELEASE.
+const NAV_TWIN_SIDE_ENGAGE_CM = 28;
+const NAV_TWIN_SIDE_RELEASE_CM = 36;
 // עוצמה נומינלית: shapeMotorSpeed ממפה לרצועת הכוח, והמוק גוזר כיוון בלבד (כמו
 // שהחוף קובע את העוצמה בפועל בסירה) — כך שהמספר עצמו לא משנה, רק הסימן.
 const NAV_TWIN_PWM = 100;
@@ -2597,7 +2668,7 @@ const NAV_TWIN_PWM = 100;
 const NAV_TWIN_BINS = 24;
 const NAV_TWIN_BIN_DEG = 15;
 const navTwin = {
-  turning: false, turnDir: 1, reverseUntil: 0,
+  turning: false, turnDir: 1, reverseUntil: 0, sideEscape: 0,
   binDist: new Array(NAV_TWIN_BINS).fill(999),
   binT: new Array(NAV_TWIN_BINS).fill(0),
 };
@@ -2605,6 +2676,7 @@ function navTwinReset() {
   navTwin.turning = false;
   navTwin.turnDir = 1;
   navTwin.reverseUntil = 0;
+  navTwin.sideEscape = 0;
   navTwin.binDist.fill(999);
   navTwin.binT.fill(0);
 }
@@ -2667,6 +2739,33 @@ function navTwinSpin(dir) {
   else         { state.cmd.leftSpeed = NAV_TWIN_PWM;  state.cmd.rightSpeed = -NAV_TWIN_PWM; }
 }
 
+// שיקוף navCruiseWithSideBalance: שיוט קדימה עם מירכוז בתוך מסדרון בלבד.
+// מירכוז חל רק כששני הצדדים קירות (שניהם < CORRIDOR) — קיר יחיד עם מים פתוחים
+// בצד השני => נסיעה ישרה (מונע נטייה אלכסונית בהתחלה ליד קיר). ⚠️ פער-נאמנות:
+// הקושחה פרופורציונלית; מודל המנוע במוק 3-מצבי (סימן בלבד), אז מקרבים: אם באמצע
+// מסדרון וההפרש מובהק (>BAND) מפילים את המנוע *הרחוק* ל-0 => קשת קדימה אל האמצע.
+function navTwinCruiseWithSideBalance(now) {
+  const left = navTwinConeMin(-90, NAV_TWIN_SIDE_HALF_DEG, now);
+  const right = navTwinConeMin(90, NAV_TWIN_SIDE_HALF_DEG, now);
+  const leftD = left.any ? left.min : 999;
+  const rightD = right.any ? right.min : 999;
+  // מרווח-הצד נשלט מהחוף (navConfig.sideStandoff): ENGAGE=standoff-12, RELEASE=standoff-4.
+  const standoff = state.navConfig?.sideStandoff ?? 40;
+  const ENGAGE = standoff - 12;
+  const RELEASE = standoff - 4;
+  const nearer = Math.min(leftD, rightD);
+  if (navTwin.sideEscape === 0) {
+    if (nearer < ENGAGE) navTwin.sideEscape = (leftD <= rightD) ? 1 : -1; // +1=ימינה (מהקיר השמאלי)
+  } else {
+    const escD = navTwin.sideEscape > 0 ? leftD : rightD;
+    const oppD = navTwin.sideEscape > 0 ? rightD : leftD;
+    if (escD >= RELEASE || oppD < ENGAGE) navTwin.sideEscape = 0;
+  }
+  if (navTwin.sideEscape > 0) { state.cmd.leftSpeed = 0; state.cmd.rightSpeed = NAV_TWIN_PWM; return; }  // הטה ימינה
+  if (navTwin.sideEscape < 0) { state.cmd.leftSpeed = NAV_TWIN_PWM; state.cmd.rightSpeed = 0; return; }  // הטה שמאלה
+  state.cmd.leftSpeed = NAV_TWIN_PWM; state.cmd.rightSpeed = NAV_TWIN_PWM;
+}
+
 // שיקוף computeAutonomousDrive: נסיעה קדימה בחרטום פנוי; סיבוב-במקום לצד הפתוח
 // כשחסום (היסטרזיס); פרץ נסיעה-לאחור בסכנת התנגשות קרובה; עצירה כשאין נתון קדמי.
 // שיקוף computeAutonomousDrive (עקוב-אחר-הפער): מכוונים אל הכיוון הפתוח ביותר
@@ -2685,30 +2784,42 @@ function updateOnboardNavTwin() {
   if (!fc.any) { state.cmd.leftSpeed = 0; state.cmd.rightSpeed = 0; return; } // אין נתון קדמי טרי
   const front = fc.min;
 
-  const fwd = navTwinDeepest(-NAV_TWIN_SCAN_HALF_DEG, NAV_TWIN_SCAN_HALF_DEG, now); // פער בקשת הקדמית
-  const all = navTwinDeepest(-180, 180, now);                                       // פער בכל כיוון
+  // פרמטרי הכיוונון נשלטים מהחוף (state.navConfig, נדחף בזמן-אמת) — נפילה-לאחור
+  // לקבועי-ברירת-המחדל אם עוד אין קונפיג. כך מכווננים מה-UI בלי בנייה מחדש.
+  const cfg = state.navConfig || {};
+  const T_BLOCK = cfg.frontBlock ?? NAV_TWIN_BLOCK_CM;
+  const T_CLEAR = cfg.frontClear ?? NAV_TWIN_CLEAR_CM;
+  const T_EMERG = cfg.frontEmergency ?? NAV_TWIN_EMERGENCY_CM;
+  const T_DECISION = cfg.decision ?? NAV_TWIN_FRONT_DECISION_CM;
+  const T_DHALF = cfg.decisionHalf ?? NAV_TWIN_DECISION_HALF_DEG;
 
-  // 1) התחייבות-לסיבוב (היסטרזיס): ממשיכים עד שהפער מיושר עם החרטום והחזית פנויה.
+  // EMERGENCY (overrides everything incl. ongoing spin): too close => immediate reverse.
+  if (front < T_EMERG) {
+    navTwin.reverseUntil = now + NAV_TWIN_REVERSE_BURST_MS;
+    navTwin.turning = false;
+    state.cmd.leftSpeed = -NAV_TWIN_PWM; state.cmd.rightSpeed = -NAV_TWIN_PWM; return;
+  }
+
+  // הפער העמוק בקשת הקדמית (±T_DHALF) — יעד הפנייה, מחושב תמיד להחלטה מוקדמת.
+  const fwd = navTwinDeepest(-T_DHALF, T_DHALF, now);
+
   if (navTwin.turning) {
-    if (Math.abs(fwd.bearing) <= NAV_TWIN_ALIGN_DEG && front >= NAV_TWIN_BLOCK_CM) navTwin.turning = false;
+    if ((Math.abs(fwd.bearing) <= NAV_TWIN_ALIGN_DEG && front >= T_BLOCK) || front >= T_CLEAR) navTwin.turning = false;
     else { navTwinSpin(navTwin.turnDir); return; }
   }
 
-  // 2) הפער מיושר עם החרטום והחזית פנויה => נסיעה קדימה.
-  if (front >= NAV_TWIN_BLOCK_CM && Math.abs(fwd.bearing) <= NAV_TWIN_ALIGN_DEG) {
-    state.cmd.leftSpeed = NAV_TWIN_PWM; state.cmd.rightSpeed = NAV_TWIN_PWM; return;
+  // 2) שיוט: נתיב פתוח (front>=DECISION) או פער ישר לפנים => נסיעה ישרה + מרווח צד.
+  const gapAhead = (fwd.clear >= T_BLOCK && Math.abs(fwd.bearing) <= NAV_TWIN_ALIGN_DEG);
+  if (front >= T_DECISION || (gapAhead && front >= T_BLOCK)) {
+    navTwinCruiseWithSideBalance(now); return;
   }
 
-  // 3) צריך לפנות: יעד = הפער הקדמי אם פתוח מספיק, אחרת הפער הטוב בכל כיוון.
+  // 3) הימנעות: בוחרים את הצד הפתוח ומסתובבים-במקום אליו (מוקדם, בתוך ה-120°).
   let target;
-  if (fwd.clear >= NAV_TWIN_BLOCK_CM) target = fwd.bearing;
-  else if (all.clear >= NAV_TWIN_BLOCK_CM) target = all.bearing;
-  else {
-    // "קופסה": שום כיוון אינו פתוח. אם החזית קרובה מסוכן => פרץ נסיעה לאחור.
-    if (front < NAV_TWIN_EMERGENCY_CM) {
-      navTwin.reverseUntil = now + NAV_TWIN_REVERSE_BURST_MS;
-      state.cmd.leftSpeed = -NAV_TWIN_PWM; state.cmd.rightSpeed = -NAV_TWIN_PWM; return;
-    }
+  if (fwd.clear >= T_BLOCK) {
+    target = fwd.bearing;
+  } else {
+    const all = navTwinDeepest(-180, 180, now);
     target = all.bearing;
   }
   navTwin.turnDir = target >= 0 ? 1 : -1;  // סיבוב לעבר הפער
@@ -3212,14 +3323,15 @@ function drawWorld() {
     worldCtx.stroke();
   }
 
-  // Sensor beam directions in the world frame (heading + servo sweep + offset).
-  // Use the effective sweep angle (boat-driven telemetry on real hardware,
-  // commanded on mock) so the beams track the physical servo.
+  // Sensor beam directions in the world frame. servo=bowOff points the front
+  // sensor at the bow, so subtract bowOff to convert the servo angle to a
+  // bow-relative bearing (matches the mock physics cast + the navigator).
   const sweep = sweepAngle();
+  const bowOff = state.nav.bowOffsetDeg ?? BOW_SERVO_OFFSET_DEG;
   worldCtx.strokeStyle = "rgba(255, 241, 118, 0.35)";
   worldCtx.lineWidth = 1;
   for (const beam of SENSOR_BEAMS) {
-    const rad = degToRad(heading + sweep + beam.dir);
+    const rad = degToRad(heading + sweep - bowOff + beam.dir);
     worldCtx.beginPath();
     worldCtx.moveTo(boat.x, boat.y);
     worldCtx.lineTo(boat.x + Math.sin(rad) * rangePx, boat.y - Math.cos(rad) * rangePx);
@@ -3253,6 +3365,7 @@ function drawWorld() {
 // the boat's path (trail). Cells only become "real" where arcs intersect.
 function accumulateRadarMap() {
   const sweep = sweepAngle();
+  const bowOff = state.nav.bowOffsetDeg ?? BOW_SERVO_OFFSET_DEG;
   const heading = state.pose.headingDeg;
   const bx = state.pose.x;
   const by = state.pose.y;
@@ -3278,8 +3391,9 @@ function accumulateRadarMap() {
     if (lastArcObs.get(beam.key) === sig) continue;
     lastArcObs.set(beam.key, sig);
 
-    // Absolute world bearing of the beam centre = heading + servo sweep + offset.
-    const center = heading + sweep + beam.dir;
+    // Absolute world bearing of the beam centre = heading + servo sweep + offset
+    // minus the servo-to-bow offset (servo=bowOff => front sensor at the bow).
+    const center = heading + sweep - bowOff + beam.dir;
     const clearTo = dist >= 999 ? sim.maxRange : dist;
 
     // Empty cone: every ray across the beam width, up to just before the arc, is
@@ -4219,6 +4333,7 @@ function updateRadarMemory() {
   // rotating boat leaves the world fixed in place (the radar view then rotates
   // the world back around the boat at draw time, keeping the bow pointing up).
   const sweep = sweepAngle();
+  const bowOff = state.nav.bowOffsetDeg ?? BOW_SERVO_OFFSET_DEG;
   const heading = state.pose.headingDeg;
   const bx = state.pose.x;
   const by = state.pose.y;
@@ -4271,7 +4386,7 @@ function updateRadarMemory() {
           const pv = prevBeamVal[beam.key];
           const nv = state.telemetry[beam.key];
           if (pv == null || nv == null || pv >= 999 || nv >= 999) continue;
-          const absSlot = normalizeDeg(heading + beam.dir + s);
+          const absSlot = normalizeDeg(heading + beam.dir + s - bowOff);
           const ex = radarMemory.get(absSlot);
           if (ex && !ex.filled) continue; // never clobber a real measurement
           const val = pv + (nv - pv) * frac;
@@ -4289,7 +4404,7 @@ function updateRadarMemory() {
   }
   for (const beam of SENSOR_BEAMS) {
     if (MASK_FRONT_DISPLAY && beam.masked) continue; // חיישן פגום — לא מצויר בתמונה
-    const absSlot = normalizeDeg(heading + beam.dir + sweep);
+    const absSlot = normalizeDeg(heading + beam.dir + sweep - bowOff);
     const newVal = state.telemetry[beam.key];
     if (newVal == null) continue;
     // Always refresh the timestamp when this slot is actually measured, so a
@@ -4454,12 +4569,16 @@ function drawSensorArcs(cx, cy, maxR) {
 function drawSensorBeams(cx, cy, maxR) {
   const fovHalf = 7.5;
   const sweep = sweepAngle();
+  // servo=bowOff points the front sensor at the bow, so subtract bowOff to match
+  // the dots (radarMemory) + the mock physics; SWEEP_CENTER_DEG is the extra
+  // cosmetic rotation that puts the bow straight up on the canvas.
+  const bowOff = state.nav.bowOffsetDeg ?? BOW_SERVO_OFFSET_DEG;
   radarCtx.save();
   radarCtx.lineWidth = 1.5;
   for (const beam of SENSOR_BEAMS) {
-    const startRad = degToRad(beam.dir + sweep - SWEEP_CENTER_DEG - fovHalf);
-    const endRad = degToRad(beam.dir + sweep - SWEEP_CENTER_DEG + fovHalf);
-    const centerRad = degToRad(beam.dir + sweep - SWEEP_CENTER_DEG);
+    const startRad = degToRad(beam.dir + sweep - bowOff - SWEEP_CENTER_DEG - fovHalf);
+    const endRad = degToRad(beam.dir + sweep - bowOff - SWEEP_CENTER_DEG + fovHalf);
+    const centerRad = degToRad(beam.dir + sweep - bowOff - SWEEP_CENTER_DEG);
 
     // Soft FOV fill
     radarCtx.fillStyle = beam.color.replace(", 1)", ", 0.08)");

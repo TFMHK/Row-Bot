@@ -49,9 +49,17 @@ const int NET_SERVO_NEUTRAL = 90;
 
 // אולטרה-סוני: טריגר משותף ו-4 קווי Echo (המכם על A1 כדי לחסוך פין D)
 // הטריגר עבר מ-D5 ל-D2 כדי לפנות את D5 ל-PWM של מנוע
+//
+// ⚠️ שינוי חיווט (2026-07): החיישן הקדמי המקורי (A1) התקלקל. במקומו חובר
+// החיישן שהיה מאחור אל חזית הסירה — אך הוא נשאר על קו ה-Echo המקורי שלו (A5).
+// לכן A5 מודד עכשיו את *החזית*, ו-A1 מת. כדי לתקן זאת בלי לגעת בשאר הצינור
+// מחליפים כאן בין שני הפינים: US_ECHO_FRONT_PIN => A5 (החיישן העובד שפונה
+// קדימה), US_ECHO_RADAR_PIN => A1 (החיישן המת, ממילא מדולג כ"אחורי שבור").
+// כך telemetry.usFront נושא את הקריאה הקדמית האמיתית, ושאר הקוד (ניווט, שו"ב,
+// תאום-מוק) עובד ללא שינוי. אין חיישן אחורי כלל — נותרו 3 עובדים: חזית/שמאל/ימין.
 const int US_TRIG_PIN = 2;
-const int US_ECHO_RADAR_PIN = A5;
-const int US_ECHO_FRONT_PIN = A1;
+const int US_ECHO_RADAR_PIN = A1;  // החיישן הקדמי המת (מדולג כ"אחורי שבור")
+const int US_ECHO_FRONT_PIN = A5;  // החיישן העובד שפונה עכשיו לחרטום
 const int US_ECHO_LEFT_PIN = A2;
 const int US_ECHO_RIGHT_PIN = A4;
 // חלון-האזנה ל-echo. 24ms מכסה ~400ס"מ (התקרה בקוד ממילא 400ס"מ; מעבר לכך → 999),
@@ -94,6 +102,9 @@ TelemetryPacket telemetry;
 uint8_t lastCmdSeq = 0;
 bool haveCmdSeq = false;
 uint8_t telSeq = 0;
+// מוני-מחזור לפריים קונפיג-הניווט (anti-replay נפרד מהפקודות).
+uint8_t lastNavSeq = 0;
+bool haveNavSeq = false;
 
 // Failsafe: פרק הזמן שבו היעדר פקודה תקינה נחשב "אבד קשר". במצב ידני זה מפעיל
 // עצירה והמתנה; במצב אוטומטי הניווט המובנה ממשיך (רק החיווי משתנה).
@@ -143,34 +154,60 @@ const unsigned long TELEMETRY_FALLBACK_MS = 500;
 //    הקדמי הוגדל (BLOCK) כדי להגיב מוקדם יותר.
 
 // זווית הסרוו שבה החיישן הקדמי מצביע אל חרטום הסירה (מכיול ~60°). דורש כיול ביבשה.
-const float NAV_BOW_OFFSET_DEG = 60.0f;
+float NAV_BOW_OFFSET_DEG = 60.0f;
 // כיוון הסריקה מול כיוון הסיבוב הפיזי (+1/-1). להפוך אם ימין/שמאל מתחלפים בכיול.
-const int   NAV_SWEEP_SIGN = 1;
-// חצי-רוחב מגזר החרטום (מעלות): קריאה בטווח ±זה נחשבת "לפנים".
-const float NAV_FRONT_HALF_DEG = 45.0f;
+int   NAV_SWEEP_SIGN = 1;
+// חצי-רוחב מגזר החרטום (מעלות): קריאה בטווח ±זה נחשבת "לפנים". צר בכוונה (±20)
+// כדי שרק מכשול *ישר לפנים* בנתיב יחסום — קיר צד שנראה באלכסון (למשל 20ס"מ לצד
+// בזמן שהחזית פתוחה) לא ייכנס לחרוט ולא יעצור את השיוט; קירות-צד מטופלים ע"י
+// איזון-הצד. (קודם היה ±45 כפיצוי על קיזוז-חרטום שגוי; עכשיו הקיזוז מדויק אז
+// אפשר לצמצם — מונע "החזית חסומה" שקרי ונדידה אלכסונית ליד קיר.)
+const float NAV_FRONT_HALF_DEG = 20.0f;
 // מרחק שמתחתיו החרטום חסום => עצור קדימה, פנה במקום. הוגדל (טווח הימנעות מוקדם
 // יותר, כי נמנעים מנסיעה אחורה), אך נשאר מתחת לרצפת החזר-המים של usFront (~56ס"מ)
 // כדי שמים פתוחים לא ייחשבו בטעות לחסומים.
-const int   NAV_FRONT_BLOCK_CM = 50;
+int   NAV_FRONT_BLOCK_CM = 55;
 // מרחק שמעליו החרטום נחשב פנוי שוב (היסטרזיס — מונע ריצוד בין נסיעה לסיבוב).
-const int   NAV_FRONT_CLEAR_CM = 75;
+int   NAV_FRONT_CLEAR_CM = 90;
 // "סכנת התנגשות חזיתית": קרוב מדי מכדי להסתפק בסיבוב-במקום => פרץ נסיעה לאחור.
-const int   NAV_FRONT_EMERGENCY_CM = 30;
+int   NAV_FRONT_EMERGENCY_CM = 45;
 // ניווט "עקוב-אחר-הפער" (follow-the-gap): במקום לנסוע ישר עד שנתקעים, הסירה
 // סורקת קשת קדמית ומכוונת אל הכיוון ה*פתוח ביותר*, ונוסעת רק כשהחרטום מיושר איתו.
 // כך היא פונה יזום אל מרחב פתוח (למשל ימינה בהתחלה) ולעולם לא נוסעת לתוך מכשול.
 const float NAV_SCAN_HALF_DEG = 90.0f;    // סורקים ±90° מהחרטום לחיפוש הפער העמוק ביותר
 const float NAV_ALIGN_DEG = 20.0f;        // חרטום בטווח ±זה מהפער => נוסעים; אחרת מסתובבים אליו
 const float NAV_GAP_WINDOW_DEG = 22.0f;   // חצי-חלון החרוט סביב כל כיוון-מועמד (פער רחב, לא תא בודד)
+// מרחק שבו כבר מתחילים להחליט לאן לפנות (מוקדם => הפנייה קטנה ובתוך הקשת הקדמית).
+int   NAV_FRONT_DECISION_CM = 100;
+// חצי-קשת ההחלטה הקדמית (=120° סה"כ): מחפשים בה את הפער ומכוונים אליו מוקדם.
+float NAV_DECISION_HALF_DEG = 60.0f;
 // משך פרץ הנסיעה-לאחור בחירום (מחויב — מונע ריצוד קדימה/אחורה על רעש חיישן).
 const unsigned long NAV_REVERSE_BURST_MS = 600;
+// --- שיוט מבוקר: איזון קירות-צד (מירכוז במעברים צרים) ---
+// בשיוט קדימה, אם קיר צדדי קרוב מ-NAV_SIDE_TARGET_CM הסירה מטה בעדינות את החרטום
+// הצידה (קשת קדימה, לא סיבוב-במקום) כדי להתרחק ולהתמרכז. כששני הצדדים קרובים —
+// התיקון הנטו מטה אל הצד הפתוח יותר => מירכוז אוטומטי בערוץ (למשל מעברי 70ס"מ).
+const int   NAV_SIDE_TARGET_CM = 40;   // מרחק שיוט אידיאלי מקיר צדדי
+const float NAV_SIDE_HALF_DEG  = 45.0f;// חצי-רוחב חרוט הצד (סביב ±90°)
+const float NAV_SIDE_GAIN      = 1.6f; // הגבר: כל ס"מ מתחת ליעד => כמה יחידות PWM מורידים מהמנוע הרחוק
+// מירכוז חל רק בתוך "מסדרון" — כששני הצדדים קרובים מזה (יש קיר משני הצדדים). קיר
+// יחיד עם מים פתוחים בצד השני => נוסעים ישר (לא נוטים לרוחב כל הבריכה).
+const int   NAV_SIDE_CORRIDOR_CM = 70;
+// מרחק-שמירה מקיר צד: אם צד קרוב מזה, מטים בעדינות *הרחק* ממנו (הורדת המנוע
+// הרחוק פרופורציונלית) כדי לשמור מרווח מעבר גם ליד קיר יחיד (קצה באפל בפער).
+int   NAV_SIDE_STANDOFF_CM = 40;
+// --- דגימת חיישנים: כמה פינגים למדיאן בכל זווית-סרוו ---
+const int NAV_PINGS_PER_SAMPLE = 3;    // מדיאן-של-3 (דוחה דרופאאוט/ספייק בלי לטשטש בין כיוונים)
+const int NAV_PING_GAP_MS      = 8;    // מרווח בין פינגים (הפחתת ringing של החיישן)
 // עוצמות המנוע לניווט האוטונומי נקבעות ע"י שרת החוף ומגיעות בשדות המהירות של
 // הפקודה: כשהחוף מעביר למצב אוטומטי הוא שולח את עוצמות המנוע המכוילות (למשל
 // שמאל 84 / ימין 88 — המנוע השמאלי חלש יותר). הניווט המובנה משתמש ב|ערך המוחלט|
 // של cmd.leftSpeed/cmd.rightSpeed כעוצמה לכל צד ומחליט בעצמו רק על הכיוון
 // (קדימה/סיבוב/אחורה). כך הכיול נשאר כולו בחוף — אין צורך לצרוב מחדש כדי לכוונן.
-// תוקף קריאת-מגזר: קריאה ישנה מזה נחשבת "לא ידוע".
-const unsigned long NAV_SECTOR_TTL_MS = 2000;
+// תוקף קריאת-מגזר: קריאה ישנה מזה נחשבת "לא ידוע". 4000ms מגשר על סריקת-סרוו
+// איטית (חרוט חזית צר מתרענן רק כשהסרוו עובר במרכז) כדי שהחזית לא תתיישן בין
+// מעברי-סריקה ותגרום לעצירות-המתנה; הסירה איטית וקירות מאומתים בכל סריקה.
+const unsigned long NAV_SECTOR_TTL_MS = 4000;
 
 // מצב הניווט המובנה
 bool navTurning = false;          // האם כרגע מבצעים סיבוב-הימנעות (עם היסטרזיס)
@@ -190,6 +227,7 @@ unsigned long navBinT[NAV_BINS];       // חותם-זמן אחרון לכל תא
 
 void controlMotor(int in1, int in2, int pwmPin, int speed);
 void readAllUltrasonic(int results[4]);
+void pingAllUltrasonicOnce(int results[4]);
 void showPixel(uint8_t r, uint8_t g, uint8_t b);
 void showModeColor(int mode);
 void slewRadarServoTo(int target);
@@ -199,6 +237,7 @@ void navReset();
 void navIngest(int idx, int dist, int servoAngle);
 int  navConeMin(float centerDeg, float halfDeg, unsigned long now, bool *anyFresh);
 void navDeepest(float loDeg, float hiDeg, unsigned long now, float *bestBearing, int *bestClear);
+void navCruiseWithSideBalance(unsigned long now, int magL, int magR, int *leftOut, int *rightOut);
 void computeAutonomousDrive(unsigned long now, int *leftOut, int *rightOut);
 float navNormalizeDeg(float d);
 
@@ -245,7 +284,24 @@ void loop() {
   //    שבמצב אוטומטי הניווט המובנה ישלוט ולא ערוצי המהירות הידניים שבפקודה.
   uint8_t buf[RH_ASK_MAX_MESSAGE_LEN];
   uint8_t buflen = sizeof(buf);
-  if (driver.recv(buf, &buflen) && buflen == sizeof(RfCommand)) {
+  if (driver.recv(buf, &buflen)) {
+    // קונפיג-ניווט מהחוף (כיול/כוונון מה-UI בלי צריבה) — מזוהה לפי אורך הפריים.
+    if (buflen == sizeof(RfNavConfig)) {
+      RfNavConfig nc;
+      memcpy(&nc, buf, sizeof(RfNavConfig));
+      if (rf_navcfg_verify(&nc) && (!haveNavSeq || rf_seq_fresh(nc.seq, lastNavSeq))) {
+        haveNavSeq = true;
+        lastNavSeq = nc.seq;
+        NAV_FRONT_BLOCK_CM     = rf_dist_decode(nc.frontBlock);
+        NAV_FRONT_CLEAR_CM     = rf_dist_decode(nc.frontClear);
+        NAV_FRONT_EMERGENCY_CM = rf_dist_decode(nc.frontEmergency);
+        NAV_FRONT_DECISION_CM  = rf_dist_decode(nc.decision);
+        NAV_DECISION_HALF_DEG  = (float)nc.decisionHalf;
+        NAV_SIDE_STANDOFF_CM   = rf_dist_decode(nc.sideStandoff);
+        NAV_BOW_OFFSET_DEG     = (float)nc.bowOffset;
+        NAV_SWEEP_SIGN         = (nc.flags & 0x01) ? 1 : -1;
+      }
+    } else if (buflen == sizeof(RfCommand)) {
     RfCommand in;
     memcpy(&in, buf, sizeof(RfCommand));
     if (rf_cmd_verify(&in) && (!haveCmdSeq || rf_seq_fresh(in.seq, lastCmdSeq))) {
@@ -274,6 +330,7 @@ void loop() {
         lastMode = cmd.mode;
         showModeColor(cmd.mode);
       }
+    }
     }
   }
 
@@ -368,7 +425,8 @@ void slewRadarServoTo(int target) {
 
 // קורא את כל 4 חיישני האולטרה-סוני במקביל: טריגר אחד, polling על כל ה-echo pins.
 // results[0]=radar, [1]=front, [2]=left, [3]=right  (999 = אין מדידה)
-void readAllUltrasonic(int results[4]) {
+// זהו פינג *בודד*; readAllUltrasonic עוטף אותו במדיאן של כמה פינגים לדחיית רעש.
+void pingAllUltrasonicOnce(int results[4]) {
   const int echoPins[4] = {
     US_ECHO_RADAR_PIN, US_ECHO_FRONT_PIN, US_ECHO_LEFT_PIN, US_ECHO_RIGHT_PIN
   };
@@ -412,6 +470,32 @@ void readAllUltrasonic(int results[4]) {
       long cm = (long)pulseWidth[i] / 58;
       results[i] = (cm > 0 && cm <= 400) ? (int)cm : 999;
     }
+  }
+}
+
+// דוגם כל חיישן NAV_PINGS_PER_SAMPLE פעמים *באותה זווית-סרוו* (הסרוו נייח בזמן
+// הדגימה) ומחזיר את המדיאן לכל ערוץ. מדיאן על-פני דגימות באותו כיוון דוחה גם
+// דרופאאוט בודד (999) וגם ספייק-פנטום קצר — בלי לטשטש בין כיוונים שונים (מה
+// שהיה באג בעבר). מספר קטן וקבוע (3) מספיק: המדיאן מתכנס מהר, וזמן-שהייה ארוך
+// מדי בזווית היה ממצע על-פני *מרחב* בזמן תנועה במקום על אותו ערך אמיתי.
+void readAllUltrasonic(int results[4]) {
+  int samples[4][NAV_PINGS_PER_SAMPLE];
+  for (int p = 0; p < NAV_PINGS_PER_SAMPLE; p++) {
+    int one[4];
+    pingAllUltrasonicOnce(one);
+    for (int i = 0; i < 4; i++) samples[i][p] = one[i];
+    if (p < NAV_PINGS_PER_SAMPLE - 1) delay(NAV_PING_GAP_MS);  // מרווח קצר → הפחתת ringing
+  }
+  for (int i = 0; i < 4; i++) {
+    // מיון-הכנסה קטן (NAV_PINGS_PER_SAMPLE≈3) ובחירת האיבר האמצעי = מדיאן.
+    int a[NAV_PINGS_PER_SAMPLE];
+    for (int p = 0; p < NAV_PINGS_PER_SAMPLE; p++) a[p] = samples[i][p];
+    for (int x = 1; x < NAV_PINGS_PER_SAMPLE; x++) {
+      int key = a[x], y = x - 1;
+      while (y >= 0 && a[y] > key) { a[y + 1] = a[y]; y--; }
+      a[y + 1] = key;
+    }
+    results[i] = a[NAV_PINGS_PER_SAMPLE / 2];
   }
 }
 
@@ -542,12 +626,43 @@ void navDeepest(float loDeg, float hiDeg, unsigned long now, float *bestBearing,
   *bestClear = best;
 }
 
-// מחשב את פקודת ההנעה האוטונומית — ניווט "עקוב-אחר-הפער":
-//   • מכוונים אל הכיוון הפתוח ביותר בקשת הקדמית; אם החרטום כבר מיושר איתו והחזית
-//     פנויה => נסיעה קדימה; אחרת => סיבוב-במקום לעברו (הימנעות יזומה, לא נוסעים
-//     לתוך מכשול). כך הסירה פונה אל מרחב פתוח (ולא ישר עד שנתקעת).
-//   • כל הכיוונים חסומים ("קופסה") + החזית קרובה => פרץ נסיעה לאחור (מוצא אחרון,
-//     כי המכם האחורי שבור). אין נתון קדמי טרי => עצירה עד שהסריקה תרענן.
+// שיוט קדימה עם מירכוז בתוך מסדרון: נסיעה ישרה בעוצמות שהחוף כייל (magL/magR).
+// מירכוז חל *רק* כששני הצדדים הם קירות (שניהם קרובים מ-NAV_SIDE_CORRIDOR_CM) —
+// אז מטים בעדינות (פרופורציונלית להפרש) אל הצד הרחוק יותר כדי להתמרכז, וכשמרוכז
+// (הפרש~0) נוסעים ישר. קיר יחיד עם מים פתוחים בצד השני => אין תיקון => נסיעה ישרה
+// (מונע נטייה אלכסונית על-פני כל הבריכה כשמתחילים ליד קיר). לעולם לא רוורס/סיבוב.
+void navCruiseWithSideBalance(unsigned long now, int magL, int magR, int *leftOut, int *rightOut) {
+  int l = magL, r = magR;
+  bool lFresh = false, rFresh = false;
+  int leftD  = navConeMin(-90.0f, NAV_SIDE_HALF_DEG, now, &lFresh);
+  int rightD = navConeMin( 90.0f, NAV_SIDE_HALF_DEG, now, &rFresh);
+
+  // שמירת מרווח מכל קיר צד קרוב מ-NAV_SIDE_STANDOFF_CM: מורידים הספק מהמנוע *הרחוק*
+  // פרופורציונלית לחוסר => קשת קדימה עדינה המתרחקת מהקיר (מרווח מעבר גם ליד קיר
+  // יחיד/קצה באפל). שני צדדים קרובים => שני התיקונים => הנטו מטה אל הצד הפתוח = מירכוז.
+  if (lFresh && leftD < NAV_SIDE_STANDOFF_CM) {   // קיר משמאל קרוב => הטה ימינה (הורד מנוע ימין)
+    int trim = (int)((NAV_SIDE_STANDOFF_CM - leftD) * NAV_SIDE_GAIN);
+    if (trim > magR) trim = magR;
+    r -= trim;
+  }
+  if (rFresh && rightD < NAV_SIDE_STANDOFF_CM) {  // קיר מימין קרוב => הטה שמאלה (הורד מנוע שמאל)
+    int trim = (int)((NAV_SIDE_STANDOFF_CM - rightD) * NAV_SIDE_GAIN);
+    if (trim > magL) trim = magL;
+    l -= trim;
+  }
+  if (l < 0) l = 0;
+  if (r < 0) r = 0;
+  *leftOut = l; *rightOut = r;
+}
+
+// מחשב את פקודת ההנעה האוטונומית — מכונת-מצבים "שיוט/הימנעות/חירום":
+//   • שיוט: כל עוד החרטום פנוי (front >= BLOCK) נוסעים *ישר קדימה* עם איזון
+//     קירות-צד (מירכוז בערוץ). לא מכוונים אל פערים רחוקים — כך הסירה מתקדמת
+//     במסלול בכוונה ולא נודדת באלכסון.
+//   • הימנעות: החרטום חסום (front < BLOCK) => סיבוב-במקום לעבר הצד הפתוח ביותר,
+//     מחויב עד שהחרטום עצמו נפתח (front >= CLEAR), ואז חוזרים לשיוט.
+//   • חירום: "קופסה" (שום כיוון פתוח) + חזית קרובה מאוד => פרץ נסיעה-לאחור.
+//   • אין נתון קדמי טרי => עצירה עד שהסריקה תרענן.
 // עוצמת המנוע לכל צד = |המהירות שהחוף שלח|; הניווט קובע רק את הכיוון.
 void computeAutonomousDrive(unsigned long now, int *leftOut, int *rightOut) {
   int magL = abs(cmd.leftSpeed);  if (magL > 255) magL = 255;
@@ -559,20 +674,34 @@ void computeAutonomousDrive(unsigned long now, int *leftOut, int *rightOut) {
     return;
   }
 
-  // מרחק פנוי בחזית (לבדיקת בטיחות-נסיעה) + הכיוון הפתוח ביותר בקשת ובמעגל המלא.
+  // מרחק פנוי בחרוט החרטום (±NAV_FRONT_HALF_DEG).
   bool frontFresh = false;
   int front = navConeMin(0.0f, NAV_FRONT_HALF_DEG, now, &frontFresh);
   if (!frontFresh) { *leftOut = 0; *rightOut = 0; return; }  // אין נתון קדמי טרי => עצור
 
-  float fwdB; int fwdClear;
-  navDeepest(-NAV_SCAN_HALF_DEG, NAV_SCAN_HALF_DEG, now, &fwdB, &fwdClear);  // הפער הטוב בקשת הקדמית
-  float allB; int allClear;
-  navDeepest(-180.0f, 180.0f, now, &allB, &allClear);                        // הפער הטוב בכל כיוון
+  // EMERGENCY (overrides everything incl. an ongoing spin): bow too close =>
+  //   immediate committed reverse to actively open distance. In-place spinning
+  //   does NOT move away from the wall, and drift/waves/wind push us in; back
+  //   off at once. MUST precede the turn hysteresis, else a committed spin
+  //   swallows this check while we drift into the wall.
+  if (front < NAV_FRONT_EMERGENCY_CM) {
+    navReverseUntil = now + NAV_REVERSE_BURST_MS;
+    navTurning = false;
+    *leftOut = -magL; *rightOut = -magR;
+    return;
+  }
 
-  // 1) התחייבות-לסיבוב (היסטרזיס): אם מסתובבים, המשך עד שהפער מיושר עם החרטום
-  //    והחזית פנויה — כדי לא לבטל סיבוב באמצע בגלל ריצוד.
+  // 1) התחייבות-לסיבוב (היסטרזיס): ברגע שנכנסנו להימנעות, ממשיכים לסובב-במקום
+  //    לעבר הצד שנבחר עד שה*חרטום עצמו* נפתח (front >= CLEAR) — ואז חוזרים לשיוט.
+  //    לא מחכים ליישור עם הפער העמוק (זה מה שגרם לנדידה האלכסונית); די בכך שיש
+  //    מים פתוחים ישר מלפנים כדי לנסוע.
+  // הפער העמוק ביותר בקשת הקדמית של 120° (±NAV_DECISION_HALF_DEG) — יעד הפנייה.
+  // מחושב תמיד כדי להחליט *מוקדם* (עוד לפני חסימה) ולוודא שהפנייה נשארת בתוך ה-120°.
+  float fwdB; int fwdClear;
+  navDeepest(-NAV_DECISION_HALF_DEG, NAV_DECISION_HALF_DEG, now, &fwdB, &fwdClear);
+
   if (navTurning) {
-    if (fabs(fwdB) <= NAV_ALIGN_DEG && front >= NAV_FRONT_BLOCK_CM) {
+    if ((fabs(fwdB) <= NAV_ALIGN_DEG && front >= NAV_FRONT_BLOCK_CM) || front >= NAV_FRONT_CLEAR_CM) {
       navTurning = false;
     } else {
       if (navTurnDir > 0) { *leftOut = magL;  *rightOut = -magR; }
@@ -581,27 +710,25 @@ void computeAutonomousDrive(unsigned long now, int *leftOut, int *rightOut) {
     }
   }
 
-  // 2) הפער מיושר עם החרטום והחזית פנויה => נסיעה קדימה.
-  if (front >= NAV_FRONT_BLOCK_CM && fabs(fwdB) <= NAV_ALIGN_DEG) {
-    *leftOut = magL; *rightOut = magR;
+  // 2) שיוט: החרטום פנוי => נסיעה *ישר קדימה* (כיוון החרטום) עם איזון קירות-צד.
+  //    בלי כיוון אל פערים רחוקים — התקדמות ישרה בכוונה, ממורכזת בערוץ; מכשולים
+  //    מטופלים תגובתית בשלב (3).
+  bool gapAhead = (fwdClear >= NAV_FRONT_BLOCK_CM && fabs(fwdB) <= NAV_ALIGN_DEG);
+  if (front >= NAV_FRONT_DECISION_CM || (gapAhead && front >= NAV_FRONT_BLOCK_CM)) {
+    navCruiseWithSideBalance(now, magL, magR, leftOut, rightOut);
     return;
   }
 
-  // 3) צריך לפנות: בוחרים יעד-פנייה = הפער הקדמי אם הוא פתוח מספיק, אחרת הפער
-  //    הטוב ביותר בכל כיוון (גם מאחור — מסתובבים לעברו בלי לנסוע אחורה).
+  // 3) הימנעות: החרטום חסום => בוחרים את הצד הפתוח ביותר ומסתובבים-במקום אליו
+  //    (מחויב דרך ההיסטרזיס למעלה). סורקים קודם את הקשת הקדמית; אם אין שם פתח,
+  //    שוקלים את כל הכיוונים. "קופסה" אמיתית + קרוב מסוכן => פרץ נסיעה-לאחור.
   float target;
   if (fwdClear >= NAV_FRONT_BLOCK_CM) {
     target = fwdB;
-  } else if (allClear >= NAV_FRONT_BLOCK_CM) {
-    target = allB;
   } else {
-    // "קופסה": שום כיוון אינו פתוח. אם החזית קרובה מסוכן => פרץ נסיעה לאחור.
-    if (front < NAV_FRONT_EMERGENCY_CM) {
-      navReverseUntil = now + NAV_REVERSE_BURST_MS;
-      *leftOut = -magL; *rightOut = -magR;
-      return;
-    }
-    target = allB;  // מסתובבים לעבר הפחות-חסום עד שייפתח משהו
+    float allB; int allClear;
+    navDeepest(-180.0f, 180.0f, now, &allB, &allClear);
+    target = allB;  // מסתובבים לעבר הפחות-חסום (גם מאחור) עד שייפתח משהו
   }
 
   navTurnDir = (target >= 0.0f) ? 1 : -1;   // סיבוב לעבר הפער (target>0 => חרטום ימינה)

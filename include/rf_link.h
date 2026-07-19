@@ -97,6 +97,21 @@ struct __attribute__((packed)) RfTelemetry {
   uint8_t mac[2];   // 2 הבתים הנמוכים של HalfSipHash על 6 הבתים הראשונים
 };
 
+// קונפיג ניווט: חוף -> סירה. 11 בתים. מאפשר לכייל/לכוונן את הניווט המובנה מה-UI
+// בלי צריבה מחדש (נשלח מדי פעם + בכל שינוי). מרחקים בקידוד ס"מ/2, זוויות גולמיות.
+struct __attribute__((packed)) RfNavConfig {
+  uint8_t seq;            // מונה-מחזור נפרד (anti-replay)
+  uint8_t frontBlock;     // ס"מ/2
+  uint8_t frontClear;     // ס"מ/2
+  uint8_t frontEmergency; // ס"מ/2
+  uint8_t decision;       // ס"מ/2
+  uint8_t decisionHalf;   // מעלות (0..90)
+  uint8_t sideStandoff;   // ס"מ/2
+  uint8_t bowOffset;      // מעלות (0..180) — קיזוז החרטום
+  uint8_t flags;          // bit0 = כיוון-סריקה (1=+1, 0=-1)
+  uint8_t mac[2];         // MAC על 9 הבתים הראשונים
+};
+
 // ===== קידוד/פענוח שדות =====
 static inline uint8_t rf_dist_encode(int16_t cm) {
   if (cm < 0 || cm >= 999) return 255;   // אין הד / סמן
@@ -136,6 +151,16 @@ static inline void rf_tel_sign(RfTelemetry *p) {
 }
 static inline bool rf_tel_verify(const RfTelemetry *p) {
   uint32_t t = rf_halfsiphash((const uint8_t *)p, 6);
+  return p->mac[0] == (uint8_t)(t & 0xff) &&
+         p->mac[1] == (uint8_t)((t >> 8) & 0xff);
+}
+static inline void rf_navcfg_sign(RfNavConfig *p) {
+  uint32_t t = rf_halfsiphash((const uint8_t *)p, 9);
+  p->mac[0] = (uint8_t)(t & 0xff);
+  p->mac[1] = (uint8_t)((t >> 8) & 0xff);
+}
+static inline bool rf_navcfg_verify(const RfNavConfig *p) {
+  uint32_t t = rf_halfsiphash((const uint8_t *)p, 9);
   return p->mac[0] == (uint8_t)(t & 0xff) &&
          p->mac[1] == (uint8_t)((t >> 8) & 0xff);
 }

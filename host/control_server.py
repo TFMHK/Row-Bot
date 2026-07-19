@@ -82,6 +82,9 @@ def list_navlogs() -> list:
 # reply finished -> half-duplex collision -> both frames lost (observed: ~0.5
 # telemetry/s at close range). 400ms comfortably fits the round-trip.
 HEARTBEAT_INTERVAL_S = 0.40
+# How often the shore re-sends the nav-config frame so a boat that just rebooted
+# (or was armed late) still picks up the current UI tuning without a fresh flash.
+NAVCFG_RESEND_INTERVAL_S = 2.0
 
 # --- Real-world link resilience --------------------------------------------
 # Telemetry is considered STALE if no fresh frame arrived within this window.
@@ -162,6 +165,16 @@ MOCK_SENSOR_JITTER_CM = 2.0        # 1-sigma gaussian jitter on good pings
 # baffle is a few centimetres thick; model it as a 5 cm band.
 MOCK_WALL_THICKNESS_CM = 5.0
 
+# Servo-to-bow offset (degrees): on the REAL boat the servo home (angle 0) is
+# NOT aligned with the bow — the bow sits at servo ~60°, so the onboard nav (and
+# its mock twin) recover a sensor's bow-relative bearing as (base + servo - 60).
+# The mock MUST bake in the SAME offset so servo 60 => front sensor points at the
+# bow, exactly like the water; otherwise the simulated geometry is rotated 60°
+# from what the navigator assumes and "works in mock" no longer implies "works on
+# water". Keep in sync with NAV_BOW_OFFSET_DEG in src/main.cpp and
+# BOW_SERVO_OFFSET_DEG in app.js.
+MOCK_BOW_OFFSET_DEG = 60.0
+
 
 def filter_near_reading(value: int) -> int:
     """Drop sensor points closer than MIN_VALID_DISTANCE_CM (return sentinel)."""
@@ -196,6 +209,18 @@ def motor_direction(value: int) -> int:
     if shaped < 0:
         return -1
     return 0
+
+
+def build_nav_config_line(nc: "NavConfig") -> str:
+    """Serialize the onboard-nav tuning into the shore's 'N,...' line. The shore
+    relay parses this, packs it into a signed RfNavConfig frame and forwards it
+    to the boat over RF, so all nav calibration is done from the UI (no reflash).
+    Field order MUST match the shore sscanf + the firmware decode."""
+    return (
+        f"N,{nc.frontBlock},{nc.frontClear},{nc.frontEmergency},"
+        f"{nc.decision},{nc.decisionHalf},{nc.sideStandoff},"
+        f"{nc.bowOffset},{nc.sweepSign}\n"
+    )
 
 
 def build_serial_line(
@@ -279,6 +304,20 @@ class CommandState:
 
 
 @dataclass
+class NavConfig:
+    """Onboard-nav tuning params, shore-controlled from the UI. Applied live to
+    the mock twin; sent to the boat over RF when auto is armed (once flashed)."""
+    frontBlock: int = 55      # front < this => avoidance turn
+    frontClear: int = 90      # spin until front >= this (hysteresis release)
+    frontEmergency: int = 45  # front < this => committed reverse (drift safety)
+    decision: int = 100       # start deciding the turn this far out (early)
+    decisionHalf: int = 60    # half of the forward decision arc (=120 deg total)
+    sideStandoff: int = 40    # keep this clearance from side walls when passing
+    bowOffset: int = 60       # bow-vs-servo mounting offset (deg) — land calibration
+    sweepSign: int = 1        # radar sweep / turn polarity: +1 or -1 (land calibration)
+
+
+@dataclass
 class BridgeState:
     connected: bool = False
     mockEnabled: bool = False
@@ -289,6 +328,7 @@ class BridgeState:
     stale: bool = False
     motorLeftAbs: int = MOTOR_LEFT_ABS_DEFAULT
     motorRightAbs: int = MOTOR_RIGHT_ABS_DEFAULT
+    navConfig: NavConfig = field(default_factory=NavConfig)
     telemetry: Telemetry = field(default_factory=Telemetry)
     command: CommandState = field(default_factory=CommandState)
 
@@ -309,6 +349,9 @@ class SerialBridge:
         # traffic — critical on the half-duplex link, where every extra shore TX
         # is a window in which the boat's return telemetry collides and is lost.
         self._last_serial_write_ts = 0.0
+        # Wall-clock of the last nav-config frame sent to the shore (throttles the
+        # periodic resend in the heartbeat; reset on connect to push it promptly).
+        self._last_navcfg_write_ts = 0.0
         # Last successfully-connected port/baud, so the watchdog can reopen the
         # link on its own when telemetry goes stale (real RF bridges hang).
         self._last_port: str = ""
@@ -387,6 +430,7 @@ class SerialBridge:
             self._serial = serial.Serial(port_name, baud_rate, timeout=0.2)
             time.sleep(2.0)
             self._state.connected = True
+            self._last_navcfg_write_ts = 0.0  # force a nav-config push on the next beat
             self._state.serialPort = port_name
             self._state.baudRate = baud_rate
             self._state.lastError = ""
@@ -429,8 +473,8 @@ class SerialBridge:
                     # (upper baffle) -> up.
                     self._sim_targets = self._create_rectangle_targets()
                     self._sim_boat_x = -(self._sim_bounds_half_x - 20)
-                    self._sim_boat_y = -(self._sim_bounds_half_y - 30)
-                    self._sim_boat_heading_rad = 0.0
+                    self._sim_boat_y = -(self._sim_bounds_half_y - 40)
+                    self._sim_boat_heading_rad = math.pi / 2  # פונה ימינה (+x), לא למעלה
                     self._sim_goal = {
                         "x": -(self._sim_bounds_half_x - 20),
                         "y": self._sim_bounds_half_y - 30,
@@ -560,6 +604,43 @@ class SerialBridge:
             self._publish()
             return self.snapshot()
 
+    def set_nav_config(self, payload: dict[str, Any]) -> BridgeState:
+        """Update the shore-controlled onboard-nav tuning params. Each key is
+        optional and clamped to a sane range. Broadcast so the mock twin (and,
+        once flashed, the boat) picks up the new values live."""
+        with self._lock:
+            c = self._state.navConfig
+
+            def upd(key: str, lo: int, hi: int) -> None:
+                if payload.get(key) is not None:
+                    setattr(c, key, clamp(int(payload[key]), lo, hi))
+
+            upd("frontBlock", 10, 300)
+            upd("frontClear", 10, 320)
+            upd("frontEmergency", 5, 200)
+            upd("decision", 20, 400)
+            upd("decisionHalf", 10, 90)
+            upd("sideStandoff", 5, 200)
+            upd("bowOffset", 0, 180)
+            upd("sweepSign", -1, 1)
+            # Push the new tuning to the boat immediately (also periodically
+            # resent by the heartbeat so a rebooted boat re-syncs on its own).
+            self._send_nav_config_locked()
+            self._publish()
+            return self.snapshot()
+
+    def _send_nav_config_locked(self) -> None:
+        """Write the current nav-config 'N,...' line to the serial link. Assumes
+        the bridge lock is held. No-op when the port is closed (mock)."""
+        ser = self._serial
+        if ser is None or not ser.is_open:
+            return
+        try:
+            ser.write(build_nav_config_line(self._state.navConfig).encode("ascii"))
+            self._last_navcfg_write_ts = time.time()
+        except Exception:
+            pass
+
     def snapshot(self) -> BridgeState:
         with self._lock:
             last = self._state.lastMessageAt
@@ -578,6 +659,7 @@ class SerialBridge:
                 stale=is_stale,
                 motorLeftAbs=self._state.motorLeftAbs,
                 motorRightAbs=self._state.motorRightAbs,
+                navConfig=NavConfig(**asdict(self._state.navConfig)),
                 telemetry=Telemetry(**asdict(self._state.telemetry)),
                 command=CommandState(**asdict(self._state.command)),
             )
@@ -672,6 +754,11 @@ class SerialBridge:
                 ser = self._serial
                 if ser is None or not ser.is_open:
                     continue
+                # Periodic nav-config resend: cheap keep-alive so a boat that
+                # reboots (or is armed after the params were set) re-syncs its
+                # tuning without a reflash. Rare enough not to load the link.
+                if time.time() - self._last_navcfg_write_ts >= NAVCFG_RESEND_INTERVAL_S:
+                    self._send_nav_config_locked()
                 # Only retransmit if the UI hasn't sent a command recently. When
                 # the UI is actively driving (commands every ~250ms) this never
                 # fires, so the shore isn't flooded and the boat's return
@@ -805,7 +892,10 @@ class SerialBridge:
                 #   * They all rotate together as the servo turns, so a sweep of
                 #     just 0..90° already covers the full 360° around the boat.
                 #   * radarAngle is the servo position, commanded by the PC and
-                #     echoed back; at angle 0 the sensors point F / R / B / L.
+                #     echoed back; at servo 60° the front sensor points at the BOW
+                #     (the fixed servo-to-bow offset, MOCK_BOW_OFFSET_DEG), just
+                #     like the real hull — so the navigator's (base+servo-60)
+                #     bearing recovery is geometrically faithful here too.
                 max_range = 450
                 fov_deg = 15
                 boat_heading_deg = math.degrees(self._sim_boat_heading_rad)
@@ -813,11 +903,16 @@ class SerialBridge:
                 # The servo follows the last PC command (the firmware just echoes
                 # cmd.radarAngle). No sweep is invented here; the PC drives it.
                 sweep = self._state.command.radarAngle
+                # Cast angle: subtract the bow offset so servo 60° => the front
+                # sensor's ray points along the bow (heading), matching the real
+                # geometry. Telemetry still echoes the RAW servo angle (sweep) —
+                # the navigator applies the bow offset itself (base+servo-60).
+                cast = sweep - MOCK_BOW_OFFSET_DEG
 
-                us_front = self._cast_sensor_ray(boat_heading_deg + sweep + 0, fov_deg, max_range)
-                us_right = self._cast_sensor_ray(boat_heading_deg + sweep + 90, fov_deg, max_range)
-                us_back = self._cast_sensor_ray(boat_heading_deg + sweep + 180, fov_deg, max_range)
-                us_left = self._cast_sensor_ray(boat_heading_deg + sweep + 270, fov_deg, max_range)
+                us_front = self._cast_sensor_ray(boat_heading_deg + cast + 0, fov_deg, max_range)
+                us_right = self._cast_sensor_ray(boat_heading_deg + cast + 90, fov_deg, max_range)
+                us_back = self._cast_sensor_ray(boat_heading_deg + cast + 180, fov_deg, max_range)
+                us_left = self._cast_sensor_ray(boat_heading_deg + cast + 270, fov_deg, max_range)
 
                 # Real ultrasonic hardware is noisy: an occasional ping returns no
                 # echo at all, another comes back as a phantom short reading, and
@@ -1101,6 +1196,10 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
 
             if self.path == "/api/motorconfig":
                 self._send_json({"state": asdict(BRIDGE.set_motor_config(body))})
+                return
+
+            if self.path == "/api/navconfig":
+                self._send_json({"state": asdict(BRIDGE.set_nav_config(body))})
                 return
 
             if self.path == "/api/navlog":

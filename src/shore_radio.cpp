@@ -13,6 +13,7 @@ RH_ASK driver(2000, 11, 10);
 // האחרון שהתקבל בטלמטריה. haveTelSeq=false => פריים טלמטריה חתום ראשון מתקבל
 // בלי בדיקת-רעננות כדי להסתנכרן למונה של הסירה, ואז חוסמים replay.
 uint8_t cmdSeq = 0;
+uint8_t navSeq = 0;  // מונה-מחזור נפרד לפריים קונפיג-הניווט
 uint8_t lastTelSeq = 0;
 bool haveTelSeq = false;
 
@@ -29,6 +30,28 @@ void loop() {
   // 1. קריאת פקודות מהמחשב (CSV על ה-Serial), דחיסה+חתימה ושידור לסירה.
   if (Serial.available() > 0) {
     String inputData = Serial.readStringUntil('\n');
+    if (inputData.length() > 0 && inputData[0] == 'N') {
+      // קונפיג-ניווט מהמחשב (כיול/כוונון בלי צריבה). פורמט:
+      // N,block,clear,emergency,decision,decisionHalf,sideStandoff,bowOffset,sweepSign
+      int b, c, e, d, dh, ss, bo, sg;
+      int np = sscanf(inputData.c_str(), "N,%d,%d,%d,%d,%d,%d,%d,%d",
+                      &b, &c, &e, &d, &dh, &ss, &bo, &sg);
+      if (np == 8) {
+        RfNavConfig nc;
+        nc.seq            = navSeq++;
+        nc.frontBlock     = rf_dist_encode(b);
+        nc.frontClear     = rf_dist_encode(c);
+        nc.frontEmergency = rf_dist_encode(e);
+        nc.decision       = rf_dist_encode(d);
+        nc.decisionHalf   = (uint8_t)constrain(dh, 0, 180);
+        nc.sideStandoff   = rf_dist_encode(ss);
+        nc.bowOffset      = (uint8_t)constrain(bo, 0, 180);
+        nc.flags          = (sg >= 0) ? 0x01 : 0x00;
+        rf_navcfg_sign(&nc);
+        driver.send((uint8_t*)&nc, sizeof(RfNavConfig));
+        driver.waitPacketSent();
+      }
+    } else {
     int leftSpeed, rightSpeed, winchSpeed, radarAngle, mode;
     int parsed = sscanf(inputData.c_str(), "%d,%d,%d,%d,%d",
                         &leftSpeed, &rightSpeed, &winchSpeed, &radarAngle, &mode);
@@ -47,6 +70,7 @@ void loop() {
       rf_cmd_sign(&out);
       driver.send((uint8_t*)&out, sizeof(RfCommand));
       driver.waitPacketSent();
+    }
     }
   }
 

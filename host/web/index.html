@@ -119,6 +119,19 @@
               <input id="motorRightAbs" type="number" min="0" max="150" step="1" inputmode="numeric" />
             </div>
           </article>
+
+          <article class="card motor-speed-card nav-tune-card">
+            <h3>כיוונון ניווט אוטונומי</h3>
+            <p class="motor-speed-hint">פרמטרים לניווט האוטונומי (נשלטים מהחוף, מוחלים מיידית).</p>
+            <div class="motor-speed-row"><label for="navFrontBlock">חסימה קדמית (ס"מ)</label><input id="navFrontBlock" type="number" min="10" max="300" step="1" inputmode="numeric" /></div>
+            <div class="motor-speed-row"><label for="navFrontClear">פינוי קדמי (ס"מ)</label><input id="navFrontClear" type="number" min="10" max="320" step="1" inputmode="numeric" /></div>
+            <div class="motor-speed-row"><label for="navFrontEmergency">חירום/רוורס (ס"מ)</label><input id="navFrontEmergency" type="number" min="5" max="200" step="1" inputmode="numeric" /></div>
+            <div class="motor-speed-row"><label for="navDecision">מרחק החלטה (ס"מ)</label><input id="navDecision" type="number" min="20" max="400" step="1" inputmode="numeric" /></div>
+            <div class="motor-speed-row"><label for="navDecisionHalf">חצי-קשת החלטה (°)</label><input id="navDecisionHalf" type="number" min="10" max="90" step="1" inputmode="numeric" /></div>
+            <div class="motor-speed-row"><label for="navSideStandoff">מרווח צד (ס"מ)</label><input id="navSideStandoff" type="number" min="5" max="200" step="1" inputmode="numeric" /></div>
+            <div class="motor-speed-row"><label for="navBowOffset">קיזוז חרטום (°)</label><input id="navBowOffset" type="number" min="0" max="180" step="1" inputmode="numeric" /></div>
+            <div class="motor-speed-row"><label for="navSweepSign">כיוון פנייה/סריקה</label><select id="navSweepSign"><option value="1">ישר (+1)</option><option value="-1">הפוך (-1)</option></select></div>
+          </article>
         </div>
       </section>
 
@@ -145,6 +158,6 @@
     </main>
 
     <script src="./serial-bridge.js?v=20260716a" defer></script>
-    <script src="./app.js?v=20260717f-followgap" defer></script>
+    <script src="./app.js?v=20260720a-navrf" defer></script>
   </body>
 </html>

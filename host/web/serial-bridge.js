@@ -43,6 +43,10 @@
   const MOCK_SENSOR_SPIKE_P = 0.03;
   const MOCK_SENSOR_JITTER_CM = 2.0;
   const MOCK_WALL_THICKNESS_CM = 5.0;
+  // Servo-to-bow offset: bake it in so servo 60° => front sensor points at the
+  // bow, matching the real hull and the navigator's (base+servo-60) recovery.
+  // Keep in sync with NAV_BOW_OFFSET_DEG (firmware) / BOW_SERVO_OFFSET_DEG (app.js).
+  const MOCK_BOW_OFFSET_DEG = 60;
 
   const BAUD_RATE = 115200;
 
@@ -482,8 +486,8 @@
         } else {
           this._createRectangle();
           this._simBoatX = -(this._simBoundsHalfX - 20);
-          this._simBoatY = -(this._simBoundsHalfY - 30);
-          this._simHeadingRad = 0;
+          this._simBoatY = -(this._simBoundsHalfY - 40);
+          this._simHeadingRad = Math.PI / 2; // פונה ימינה (+x), לא למעלה
           this._simGoal = { x: -(this._simBoundsHalfX - 20), y: this._simBoundsHalfY - 30 };
         }
         this._simStart = { x: this._simBoatX, y: this._simBoatY };
@@ -607,11 +611,14 @@
       const fovDeg = 15;
       const headingDeg = (this._simHeadingRad * 180) / Math.PI;
       const sweep = this._state.command.radarAngle;
+      // Cast angle subtracts the bow offset (telemetry still echoes raw sweep;
+      // the navigator applies the offset itself). servo 60° => front at bow.
+      const cast = sweep - MOCK_BOW_OFFSET_DEG;
 
-      let usFront = this._castRay(headingDeg + sweep + 0, fovDeg, maxRange);
-      let usRight = this._castRay(headingDeg + sweep + 90, fovDeg, maxRange);
-      let usBack = this._castRay(headingDeg + sweep + 180, fovDeg, maxRange);
-      let usLeft = this._castRay(headingDeg + sweep + 270, fovDeg, maxRange);
+      let usFront = this._castRay(headingDeg + cast + 0, fovDeg, maxRange);
+      let usRight = this._castRay(headingDeg + cast + 90, fovDeg, maxRange);
+      let usBack = this._castRay(headingDeg + cast + 180, fovDeg, maxRange);
+      let usLeft = this._castRay(headingDeg + cast + 270, fovDeg, maxRange);
 
       usFront = this._noisy(usFront, maxRange);
       usRight = this._noisy(usRight, maxRange);
